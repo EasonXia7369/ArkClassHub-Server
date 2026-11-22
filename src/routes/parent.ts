@@ -34,10 +34,112 @@ async function classByKey(c: any, key: string): Promise<{ id: number; name: stri
   return c.env.DB.prepare('SELECT id, name FROM classes WHERE parent_key = ?1').bind(key).first()
 }
 
+/* ---------- 家长身份：学号 + 身份证后六位 双凭据 → 长效令牌 ---------- */
+
+async function sha256hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 /**
- * 家长视图（公开，凭班级 parent_key 访问）：
+ * 身份证后六位的受控录入与比对：
+ * - 录入格式：5 位数字 + 1 位数字或 X（末位校验码），不校验身份证本身合法性（由学校档案保证）
+ * - 存储形态：HMAC-SHA256(PARENT_ID_SECRET, 学生id + 归一化后六位)——不可逆、库泄露不可批量爆破
+ * - 教师端永不回传明文/哈希，仅返回是否已录入
+ */
+const ID_TAIL_RE = /^\d{5}[\dX]$/
+
+function normalizeIdTail(tail: string): string | null {
+  const t = (tail ?? '').trim().toUpperCase()
+  return ID_TAIL_RE.test(t) ? t : null
+}
+
+async function hmacIdTail(secret: string, studentId: number, tail: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${studentId}:${tail}`))
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** 家长绑定令牌：Authorization: Bearer ptk-xxx 或 ?ptk=xxx → 绑定上下文（含学生归属校验）。 */
+export async function resolveParentBind(
+  c: any,
+  key: string,
+): Promise<{ classId: number; studentId: number; studentName: string; bindId: number } | null> {
+  const auth = c.req.header('Authorization') ?? ''
+  const ptk = auth.startsWith('Bearer ptk-') ? auth.slice(11).trim() : ((c.req.query('ptk') ?? '').trim() || undefined)
+  if (!ptk || !ptk.startsWith('ptk-')) return null
+  const cls = await classByKey(c, key)
+  if (!cls) return null
+  const hash = await sha256hex(ptk)
+  const row = (await c.env.DB.prepare(
+    `SELECT b.id AS bind_id, b.student_id, st.name AS student_name
+     FROM parent_binds b
+     JOIN students st ON st.id = b.student_id AND st.active = 1
+     WHERE b.token_hash = ?1 AND b.class_id = ?2`,
+  )
+    .bind(hash, cls.id)
+    .first()) as { bind_id: number; student_id: number; student_name: string } | null
+  if (!row) return null
+  return { classId: cls.id, studentId: row.student_id, studentName: row.student_name, bindId: row.bind_id }
+}
+
+/** 家长绑定：学号 + 身份证后六位 双凭据校验 → 签发长效令牌。限流防枚举。 */
+parentRoutes.post('/api/parent/:key/bind', async (c) => {
+  const ip = c.req.header('CF-Connecting-IP') ?? c.req.header('X-Forwarded-For') ?? '?'
+  if (codeRateLimited(ip)) return c.json({ error: '尝试太频繁，请一分钟后再试' }, 429)
+  if (!c.env.PARENT_ID_SECRET) return c.json({ error: '家长身份核验未配置（需管理员配置 PARENT_ID_SECRET）' }, 503)
+  const cls = await classByKey(c, c.req.param('key'))
+  if (!cls) return c.json({ error: '链接无效' }, 404)
+  const { student_no, id_tail } = await c.req.json<{ student_no?: string; id_tail?: string }>()
+  const no = (student_no ?? '').trim()
+  const tail = normalizeIdTail(id_tail ?? '')
+  if (!no || !tail) return c.json({ error: '请输入学号和身份证后六位' }, 400)
+
+  const stu = await c.env.DB
+    .prepare('SELECT id, name, id_tail_hash FROM students WHERE class_id = ?1 AND student_no = ?2 AND active = 1')
+    .bind(cls.id, no)
+    .first<{ id: number; name: string; id_tail_hash: string | null }>()
+  if (!stu) return c.json({ error: '学号或身份证后六位不正确，请核对后重试' }, 400)
+  const expect = await hmacIdTail(c.env.PARENT_ID_SECRET, stu.id, tail)
+  if (!stu.id_tail_hash || stu.id_tail_hash !== expect) {
+    return c.json({ error: '学号或身份证后六位不正确，请核对后重试' }, 400)
+  }
+
+  const token = `ptk-${crypto.randomUUID().replaceAll('-', '')}${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
+  const hash = await sha256hex(token)
+  const hint = token.slice(-4)
+  await c.env.DB.prepare(
+    `INSERT INTO parent_binds (class_id, student_id, token_hash, token_hint) VALUES (?1,?2,?3,?4)`,
+  )
+    .bind(cls.id, stu.id, hash, hint)
+    .run()
+
+  return c.json({
+    token,
+    student: { name: maskName(stu.name), student_no: no },
+  })
+})
+
+/** 令牌使用时间更新（异步，不阻塞响应）。 */
+export function touchParentBind(c: any, bindId: number) {
+  c.executionCtx.waitUntil(
+    c.env.DB.prepare('UPDATE parent_binds SET last_used_at = ?1 WHERE id = ?2')
+      .bind(new Date().toISOString(), bindId)
+      .run()
+      .catch(() => {}),
+  )
+}
+
+/**
+ * 家长视图（凭班级 parent_key + 家长绑定令牌）：
  * 今日作业 + 今日课程（全班共享）；今日出勤/本周汇总个人化——
- * 带 ?no=<学号> 或 ?sid=<学生id> 绑定孩子后只返回该孩子的数据，未绑定时不出勤数据。
+ * 有效令牌 → 仅该孩子的个人化视图；无令牌 → 全班脱敏视图。
  */
 parentRoutes.get('/api/parent/:key', async (c) => {
   const key = c.req.param('key')
@@ -53,18 +155,10 @@ parentRoutes.get('/api/parent/:key', async (c) => {
 
   const mask = (name: string) => maskName(name)
 
-  // 绑定孩子：仅凭学号（唯一凭据）。未绑定 → 全班脱敏视图；绑定 → 仅该孩子的个人化视图
-  const no = (c.req.query('no') ?? '').trim()
-  let bound: { id: number; name: string } | null = null
-  if (no) {
-    const hit = await c.env.DB
-      .prepare(
-        'SELECT id, name FROM students WHERE class_id = ?1 AND student_no = ?2 AND active = 1',
-      )
-      .bind(classId, no)
-      .first<{ id: number; name: string }>()
-    if (hit) bound = { id: hit.id, name: mask(hit.name) }
-  }
+  // 绑定孩子：凭家长绑定令牌（学号已不再是身份凭据）。未绑定 → 全班脱敏视图
+  const bind = await resolveParentBind(c, key)
+  const bound = bind ? { id: bind.studentId, name: mask(bind.studentName) } : null
+  if (bind) touchParentBind(c, bind.bindId)
 
   const [tasks, attendance, timetable] = await Promise.all([
     c.env.DB
@@ -182,21 +276,6 @@ parentRoutes.get('/api/parent/:key', async (c) => {
 })
 
 /** 学号校验（公开）：家长输入学号即时确认绑定对象，只回脱敏名。 */
-parentRoutes.get('/api/parent/:key/lookup', async (c) => {
-  const cls = await classByKey(c, c.req.param('key'))
-  if (!cls) return c.json({ error: '链接无效' }, 404)
-  const no = (c.req.query('no') ?? '').trim()
-  if (!no) return c.json({ error: '请输入学号' }, 400)
-  const stu = await c.env.DB
-    .prepare(
-      'SELECT id, name FROM students WHERE class_id = ?1 AND student_no = ?2 AND active = 1',
-    )
-    .bind(cls.id, no)
-    .first<{ id: number; name: string }>()
-  if (!stu) return c.json({ error: '学号不存在，请核对或联系老师录入学号' }, 404)
-  return c.json({ student: { id: stu.id, name: maskName(stu.name) } })
-})
-
 /* ---------- 班级码入口：6 位数字码 → 换 parent_key ---------- */
 
 // 极简内存限流：防 6 位码枚举（单 isolate 生效，聊胜于无；码空间本身 90 万组合）
@@ -242,21 +321,15 @@ parentRoutes.get('/api/parent-lookup-code', async (c) => {
 })
 
 /**
- * 家长留言对话串（公开，凭 parent_key + ?no=学号）。
+ * 家长留言对话串（凭 parent_key + 家长绑定令牌）。
  * 隐私：只返回绑定孩子相关的消息——孩子家长发的留言 + 针对这些留言的老师回复（含引用摘要）。
- * 其他家长的留言与无关回复一律不可见。未绑定（无 no）返回空串。
+ * 其他家长的留言与无关回复一律不可见。未绑定（无令牌）返回空串。
  */
 parentRoutes.get('/api/parent/:key/messages', async (c) => {
-  const cls = await classByKey(c, c.req.param('key'))
-  if (!cls) return c.json({ error: '链接无效' }, 404)
-  const no = (c.req.query('no') ?? '').trim()
-  if (!no) return c.json({ messages: [] })
-  const stu = await c.env.DB
-    .prepare('SELECT id FROM students WHERE class_id = ?1 AND student_no = ?2 AND active = 1')
-    .bind(cls.id, no)
-    .first<{ id: number }>()
-  if (!stu) return c.json({ error: '学号不存在或已失效', messages: [] }, 404)
+  const bind = await resolveParentBind(c, c.req.param('key'))
+  if (!bind) return c.json({ messages: [] })
   const after = Number(c.req.query('after') ?? 0) || 0
+  touchParentBind(c, bind.bindId)
   const rows = (
     await c.env.DB.prepare(
       `SELECT m.id, m.sender_type, m.sender_name, m.body, m.created_at, m.reply_to,
@@ -268,19 +341,20 @@ parentRoutes.get('/api/parent/:key/messages', async (c) => {
               OR m.reply_to IN (SELECT id FROM parent_messages WHERE actor_student_id = ?3))
        ORDER BY m.id ASC LIMIT 300`,
     )
-      .bind(cls.id, after, stu.id)
+      .bind(bind.classId, after, bind.studentId)
       .all<any>()
   ).results.map((r) => ({ ...r, created_at: isoTs(r.created_at) }))
   return c.json({ messages: rows })
 })
 
-/** 家长留言（公开，凭 parent_key）。body: { body, student_no, relation, push_token? }——仅学号定位。 */
+/** 家长留言（凭 parent_key + 家长绑定令牌）。body: { body, relation, push_token? }——孩子身份来自令牌。 */
 parentRoutes.post('/api/parent/:key/messages', async (c) => {
-  const cls = await classByKey(c, c.req.param('key'))
-  if (!cls) return c.json({ error: '链接无效' }, 404)
-  const { body, student_no, relation, push_token } = await c.req.json<{
+  const bind = await resolveParentBind(c, c.req.param('key'))
+  if (!bind) return c.json({ error: '请先绑定孩子（学号 + 绑定码）' }, 401)
+  touchParentBind(c, bind.bindId)
+  const cls = { id: bind.classId }
+  const { body, relation, push_token } = await c.req.json<{
     body?: string
-    student_no?: string
     relation?: string
     push_token?: string
   }>()
@@ -298,16 +372,12 @@ parentRoutes.post('/api/parent/:key/messages', async (c) => {
     }
   }
 
-  // 署名：脱敏孩子名 + 身份（仅学号定位）
-  const no = (student_no ?? '').trim()
-  if (!no) return c.json({ error: '请先输入学号绑定孩子' }, 400)
+  // 署名：脱敏孩子名 + 身份（孩子身份来自绑定令牌）
   const target = await c.env.DB
-    .prepare(
-      'SELECT id, name FROM students WHERE class_id = ?1 AND student_no = ?2 AND active = 1',
-    )
-    .bind(cls.id, no)
+    .prepare('SELECT id, name FROM students WHERE id = ?1 AND active = 1')
+    .bind(bind.studentId)
     .first<{ id: number; name: string }>()
-  if (!target) return c.json({ error: '学号不存在，请核对后重试' }, 400)
+  if (!target) return c.json({ error: '绑定的学生已不在班级，请联系老师' }, 400)
   const senderName = maskName(target.name) + (rel === '其他' ? '家长' : rel)
 
   // 简易限流：同班 10 秒内已有家长/老师新留言则稍候

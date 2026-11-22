@@ -51,6 +51,8 @@ if (fs.existsSync(configPath)) {
     wxTmplMessage: '',
     wxTmplAttendance: '',
     wxTmplHomework: '',
+    // 家长身份核验密钥（首次启动自动生成随机值；家长绑定 = 学号 + 身份证后六位 HMAC 比对）
+    parentIdSecret: genCode(32),
   }
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2))
   console.log('[config] 已生成默认 config.json，请查看其中的引导码')
@@ -83,6 +85,8 @@ const env = {
   WX_APPSECRET: process.env.WX_APPSECRET || config.wxAppSecret || undefined,
   WX_TMPL_MESSAGE: process.env.WX_TMPL_MESSAGE || config.wxTmplMessage || undefined,
   WX_TMPL_ATTENDANCE: process.env.WX_TMPL_ATTENDANCE || config.wxTmplAttendance || undefined,
+  // 家长身份核验密钥（身份证后六位 HMAC 存储；未配置时绑定功能禁用）
+  PARENT_ID_SECRET: process.env.ARK_PARENT_ID_SECRET || config.parentIdSecret || undefined,
   WX_TMPL_HOMEWORK: process.env.WX_TMPL_HOMEWORK || config.wxTmplHomework || undefined,
   // 云托管代理共享密钥（deploy/cloud-proxy 的 ARK_PROXY_SECRET；留空 = 不信任透传 IP）
   ARK_PROXY_SECRET: process.env.ARK_PROXY_SECRET || config.proxySecret || undefined,

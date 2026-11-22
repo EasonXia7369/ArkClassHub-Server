@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import type { AppContext } from '../types.js'
 import { authenticate, requireRole } from '../auth.js'
 import { isoTs } from '../time.js'
-import { maskName } from './parent.js'
+import { maskName, resolveParentBind, touchParentBind } from './parent.js'
 
 export const examRoutes = new Hono<AppContext>()
 
@@ -372,19 +372,15 @@ examRoutes.get(
 
 examRoutes.get('/api/parent/:key/exams', async (c) => {
   const key = c.req.param('key')
-  const cls = await c.env.DB.prepare('SELECT id FROM classes WHERE parent_key = ?1').bind(key).first<{ id: number }>()
-  if (!cls) return c.json({ error: '链接无效' }, 404)
-  const no = (c.req.query('no') ?? '').trim()
-  if (!no) return c.json({ error: '请先输入学号绑定孩子' }, 400)
-  const stu = await c.env.DB
-    .prepare('SELECT id, name FROM students WHERE class_id = ?1 AND student_no = ?2 AND active = 1')
-    .bind(cls.id, no)
-    .first<{ id: number; name: string }>()
-  if (!stu) return c.json({ error: '学号不存在，请核对' }, 404)
+  const bind = await resolveParentBind(c, key)
+  if (!bind) return c.json({ error: '请先绑定孩子（学号 + 绑定码）' }, 401)
+  touchParentBind(c, bind.bindId)
+  const clsId = bind.classId
+  const stu = { id: bind.studentId, name: bind.studentName }
 
   const exams = (
     await c.env.DB.prepare('SELECT id, name, day, subjects_json FROM exams WHERE class_id = ?1 ORDER BY day ASC, id ASC')
-      .bind(cls.id)
+      .bind(clsId)
       .all<any>()
   ).results.map((r) => ({ id: r.id, name: r.name, day: r.day, subjects: parseSubjects(r.subjects_json) }))
 

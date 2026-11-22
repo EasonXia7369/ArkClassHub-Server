@@ -25,6 +25,8 @@ export interface Env {
   WX_FIELD_BODY?: string
   /** 云托管代理共享密钥（deploy/cloud-proxy 携带）：匹配时信任 X-Ark-Client-IP 透传头 */
   ARK_PROXY_SECRET?: string
+  /** 家长身份核验密钥：学生身份证后六位以 HMAC-SHA256(密钥, 学生id+后六位) 存储比对（不可逆）。未配置时绑定功能禁用 */
+  PARENT_ID_SECRET?: string
 }
 
 /** Workers AI binding 的最小接口（wrangler.jsonc 的 ai.binding 注入） */

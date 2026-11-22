@@ -139,7 +139,7 @@ classRoutes.get('/api/classes/:id', ...reader, async (c) => {
   if (!cls) return c.json({ error: '班级不存在' }, 404)
   const students = (
     await c.env.DB.prepare(
-      'SELECT id, name, seq, pinyin_initial, student_no, active FROM students WHERE class_id = ? ORDER BY seq',
+      'SELECT id, name, seq, pinyin_initial, student_no, CASE WHEN id_tail_hash IS NOT NULL THEN 1 ELSE 0 END AS has_id_tail, active FROM students WHERE class_id = ? ORDER BY seq',
     )
       .bind(cls.id)
       .all<any>()
@@ -364,6 +364,122 @@ classRoutes.post('/api/classes/:id/students', ...teacher, async (c) => {
 })
 
 /** 批量导入名单：跳过班内已有的同名学生，学号顺延。body: { students: [{ name, pinyin_initial? }] } */
+
+/* ---------- 家长身份核验（学号 + 身份证后六位；HMAC 存储，明文/哈希均不回传前端） ---------- */
+
+const ID_TAIL_RE = /^\d{5}[\dX]$/
+
+function normalizeIdTail(tail: string): string | null {
+  const t = (tail ?? '').trim().toUpperCase()
+  return ID_TAIL_RE.test(t) ? t : null
+}
+
+/** 身份证后六位 → HMAC-SHA256(PARENT_ID_SECRET, 学生id + 后六位)。密钥未配置时抛出提示。 */
+async function hmacIdTail(c: any, studentId: number, tail: string): Promise<string> {
+  const secret = c.env.PARENT_ID_SECRET
+  if (!secret) throw new Error('家长身份核验未配置（需管理员配置 PARENT_ID_SECRET）')
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${studentId}:${tail}`))
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** 录入/重置单个学生的身份证后六位（HMAC 存储；重置不撤销已绑定令牌）。 */
+classRoutes.post('/api/classes/:id/students/:sid/id-tail', ...teacher, async (c) => {
+  const classId = Number(c.req.param('id'))
+  const sid = Number(c.req.param('sid'))
+  const stu = await c.env.DB
+    .prepare('SELECT id, name FROM students WHERE id = ?1 AND class_id = ?2')
+    .bind(sid, classId)
+    .first<{ id: number; name: string }>()
+  if (!stu) return c.json({ error: '学生不存在' }, 404)
+  const { tail } = await c.req.json<{ tail?: string | null }>()
+  if (tail === null) {
+    // 显式清除
+    await c.env.DB.prepare('UPDATE students SET id_tail_hash = NULL WHERE id = ?1').bind(sid).run()
+    return c.json({ ok: true, has_id_tail: false })
+  }
+  const norm = normalizeIdTail(tail ?? '')
+  if (!norm) return c.json({ error: '身份证后六位为 5 位数字 + 1 位数字或 X' }, 400)
+  let hash: string
+  try {
+    hash = await hmacIdTail(c, sid, norm)
+  } catch (e: any) {
+    return c.json({ error: e.message }, 503)
+  }
+  await c.env.DB.prepare('UPDATE students SET id_tail_hash = ?1 WHERE id = ?2').bind(hash, sid).run()
+  return c.json({ ok: true, has_id_tail: true })
+})
+
+/** 批量录入身份证后六位：body { rows: [{student_id, tail}] }（tail 空串 = 清除该生）。 */
+classRoutes.post('/api/classes/:id/students/id-tails/bulk', ...teacher, async (c) => {
+  const classId = Number(c.req.param('id'))
+  const { rows } = await c.req.json<{ rows?: Array<{ student_id?: number; tail?: string | null }> }>()
+  if (!Array.isArray(rows) || !rows.length) return c.json({ error: 'rows 不能为空' }, 400)
+  if (rows.length > 300) return c.json({ error: '单次最多 300 条' }, 400)
+
+  const students = (
+    await c.env.DB.prepare('SELECT id, name FROM students WHERE class_id = ?1').bind(classId).all<any>()
+  ).results
+  const byId = new Map(students.map((s: any) => [s.id, s]))
+
+  const cleaned: Array<{ id: number; hash: string | null }> = []
+  const errors: Array<{ student_id: number; error: string }> = []
+  for (const item of rows) {
+    const sid = Number(item?.student_id ?? 0)
+    if (!byId.has(sid)) {
+      errors.push({ student_id: sid, error: '学生不存在' })
+      continue
+    }
+    const tail = item?.tail
+    if (tail === null || (typeof tail === 'string' && !tail.trim())) {
+      cleaned.push({ id: sid, hash: null })
+      continue
+    }
+    const norm = normalizeIdTail(String(tail))
+    if (!norm) {
+      errors.push({ student_id: sid, error: '身份证后六位格式错误（5 位数字 + 1 位数字或 X）' })
+      continue
+    }
+    let hash: string
+    try {
+      hash = await hmacIdTail(c, sid, norm)
+    } catch (e: any) {
+      return c.json({ error: e.message }, 503)
+    }
+    cleaned.push({ id: sid, hash })
+  }
+  if (errors.length) return c.json({ error: '存在格式错误，未保存', errors }, 400)
+
+  for (const row of cleaned) {
+    await c.env.DB
+      .prepare('UPDATE students SET id_tail_hash = ?1 WHERE id = ?2')
+      .bind(row.hash, row.id)
+      .run()
+  }
+  return c.json({ updated: cleaned.length })
+})
+
+/** 解绑：撤销某学生的全部家长令牌（所有已绑定设备立即失效）。 */
+classRoutes.post('/api/classes/:id/students/:sid/unbind', ...teacher, async (c) => {
+  const classId = Number(c.req.param('id'))
+  const sid = Number(c.req.param('sid'))
+  const stu = await c.env.DB
+    .prepare('SELECT id, name FROM students WHERE id = ?1 AND class_id = ?2')
+    .bind(sid, classId)
+    .first<{ id: number; name: string }>()
+  if (!stu) return c.json({ error: '学生不存在' }, 404)
+  const removed = await c.env.DB
+    .prepare('DELETE FROM parent_binds WHERE student_id = ?1 AND class_id = ?2')
+    .bind(sid, classId)
+    .run()
+  return c.json({ ok: true, removed: removed.meta.changes ?? 0 })
+})
 classRoutes.post('/api/classes/:id/students/bulk', ...teacher, async (c) => {
   const classId = Number(c.req.param('id'))
   const { students } = await c.req.json<{
