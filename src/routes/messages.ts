@@ -410,6 +410,14 @@ messageRoutes.post(
       reply_body: target.body,
     }
     await broadcast(c.env, classId, { type: 'parent-message', message })
+    // 微信订阅消息：老师回复通知该班家长订阅者（Web Push 无法触达家长，此处是家长唯一主动通知渠道）
+    sideTask(c, () =>
+      pushClass(c.env, classId, {
+        type: 'parent-message',
+        title: '老师回复了留言',
+        body: `${senderName}：${text}`,
+      }),
+    )
     return c.json({ message })
   },
 )

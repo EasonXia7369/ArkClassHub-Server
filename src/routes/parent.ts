@@ -4,6 +4,7 @@ import { pinyin } from 'pinyin-pro'
 import type { AppContext } from '../types.js'
 import { broadcast } from '../realtime.js'
 import { pushClass, sideTask } from '../push.js'
+import { verifyWxPushToken, wxConfigured, wxMsgSecCheck } from '../push-wx.js'
 import { isoTs } from '../time.js'
 
 /** 姓名脱敏：张三 → 张S（姓 + 名的拼音首字母，家长可读、外人不可读）。 */
@@ -212,8 +213,23 @@ function codeRateLimited(ip: string): boolean {
   return rec.n > 20
 }
 
+/**
+ * 客户端真实 IP：Cloudflare 直连用 CF-Connecting-IP（边缘注入，客户端伪造无效）。
+ * 经云托管代理（deploy/cloud-proxy）时全班家长共享代理出口 IP，需用代理透传的
+ * X-Ark-Client-IP 区分——但仅当 X-Ark-Proxy-Token 与 ARK_PROXY_SECRET 匹配时才信任，
+ * 防止公网直连伪造该头绕过限流。
+ */
+function clientIp(c: any): string {
+  const proxyToken = c.req.header('X-Ark-Proxy-Token')
+  if (proxyToken && c.env.ARK_PROXY_SECRET && proxyToken === c.env.ARK_PROXY_SECRET) {
+    const fwd = (c.req.header('X-Ark-Client-IP') ?? '').trim()
+    if (fwd) return fwd
+  }
+  return c.req.header('CF-Connecting-IP') ?? c.req.header('X-Forwarded-For') ?? '?'
+}
+
 parentRoutes.get('/api/parent-lookup-code', async (c) => {
-  const ip = c.req.header('CF-Connecting-IP') ?? c.req.header('X-Forwarded-For') ?? '?'
+  const ip = clientIp(c)
   if (codeRateLimited(ip)) return c.json({ error: '尝试太频繁，请一分钟后再试' }, 429)
   const code = (c.req.query('code') ?? '').trim()
   if (!/^\d{6}$/.test(code)) return c.json({ error: '班级码为 6 位数字' }, 400)
@@ -258,19 +274,29 @@ parentRoutes.get('/api/parent/:key/messages', async (c) => {
   return c.json({ messages: rows })
 })
 
-/** 家长留言（公开，凭 parent_key）。body: { body, student_no, relation }——仅学号定位。 */
+/** 家长留言（公开，凭 parent_key）。body: { body, student_no, relation, push_token? }——仅学号定位。 */
 parentRoutes.post('/api/parent/:key/messages', async (c) => {
   const cls = await classByKey(c, c.req.param('key'))
   if (!cls) return c.json({ error: '链接无效' }, 404)
-  const { body, student_no, relation } = await c.req.json<{
+  const { body, student_no, relation, push_token } = await c.req.json<{
     body?: string
     student_no?: string
     relation?: string
+    push_token?: string
   }>()
   const text = (body ?? '').trim()
   if (!text) return c.json({ error: '留言内容不能为空' }, 400)
   if (text.length > MAX_PARENT_TEXT) return c.json({ error: '留言最长 500 字' }, 400)
   const rel = RELATIONS.includes(relation as Relation) ? (relation as Relation) : '其他'
+
+  // 小程序端留言带 push_token（可解出 openid）→ 先过微信内容安全检测；Web 端无 openid 维持原行为
+  const pushToken = (push_token ?? '').trim()
+  if (pushToken && wxConfigured(c.env)) {
+    const openid = await verifyWxPushToken(pushToken, c.env.WX_APPSECRET!)
+    if (openid && (await wxMsgSecCheck(c.env, openid, text)) === 'risky') {
+      return c.json({ error: '留言内容未通过安全检查，请调整后重试' }, 400)
+    }
+  }
 
   // 署名：脱敏孩子名 + 身份（仅学号定位）
   const no = (student_no ?? '').trim()

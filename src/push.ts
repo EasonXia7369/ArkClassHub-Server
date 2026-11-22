@@ -1,4 +1,5 @@
 import type { Env } from './types.js'
+import { wxPushClass, wxPushEnabled } from './push-wx.js'
 
 /**
  * Web Push（RFC 8291 aes128gcm 加密 + RFC 8292 VAPID 鉴权）。
@@ -13,8 +14,8 @@ import type { Env } from './types.js'
 
 const DEFAULT_SUBJECT = 'mailto:ark-class-hub@macrostar.top'
 
-/** 推送业务类型：决定通知 tag（同类型覆盖）与默认跳转板块 */
-export type PushType = 'message' | 'attendance' | 'homework'
+/** 推送业务类型：决定通知 tag（同类型覆盖）与默认跳转板块；parent-message = 老师回复家长留言 */
+export type PushType = 'message' | 'parent-message' | 'attendance' | 'homework'
 
 export interface PushPayload {
   type: PushType
@@ -27,6 +28,7 @@ export interface PushPayload {
 
 const DEFAULT_URL_BY_TYPE: Record<PushType, string> = {
   message: '/messages',
+  'parent-message': '/messages?tab=parent',
   attendance: '/attendance',
   homework: '/homework',
 }
@@ -260,12 +262,30 @@ async function sendOne(
 }
 
 /**
- * 班级推送扇出：本班学生订阅 + 该班（班主任/协作教师）订阅 + 全部管理员订阅。
- * excludeDeviceId：发起操作的设备自身不收（避免自己操作自己被提醒）。
- * teachersOnly：仅教师/管理员订阅（家长留言提醒不落到教室一体机上）。
- * 单条失败不影响其他订阅；死订阅自动清理。
+ * 班级推送扇出（编排入口）：按配置并行走 Web Push 与微信订阅消息两条通道。
+ * excludeDeviceId：发起操作的设备自身不收（避免自己操作自己被提醒，仅 Web 通道生效）。
+ * teachersOnly：仅教师/管理员订阅（家长留言提醒不落到教室一体机/家长手机上）。
+ * 任一通道未配置则自动跳过；单条失败不影响其他订阅；死订阅自动清理。
  */
 export async function pushClass(
+  env: Env,
+  classId: number,
+  payload: Omit<PushPayload, 'classId' | 'url'> & { url?: string },
+  excludeDeviceId?: string,
+  opts?: { teachersOnly?: boolean },
+): Promise<void> {
+  if (!classId) return
+  const jobs: Promise<void>[] = []
+  if (pushEnabled(env)) jobs.push(webPushClass(env, classId, payload, excludeDeviceId, opts))
+  if (wxPushEnabled(env)) jobs.push(wxPushClass(env, classId, payload, opts))
+  await Promise.all(jobs)
+}
+
+/**
+ * Web Push 通道扇出：本班学生订阅 + 该班（班主任/协作教师）订阅 + 全部管理员订阅。
+ * 单条失败不影响其他订阅；死订阅自动清理。
+ */
+async function webPushClass(
   env: Env,
   classId: number,
   payload: Omit<PushPayload, 'classId' | 'url'> & { url?: string },

@@ -46,6 +46,11 @@ if (fs.existsSync(configPath)) {
     aiApiKey: '',
     aiBaseUrl: '',
     aiModel: '',
+    wxAppId: '',
+    wxAppSecret: '',
+    wxTmplMessage: '',
+    wxTmplAttendance: '',
+    wxTmplHomework: '',
   }
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2))
   console.log('[config] 已生成默认 config.json，请查看其中的引导码')
@@ -73,6 +78,14 @@ const env = {
   AI_API_KEY: process.env.ARK_AI_API_KEY || config.aiApiKey || undefined,
   AI_BASE_URL: process.env.ARK_AI_BASE_URL || config.aiBaseUrl || undefined,
   AI_MODEL: config.aiModel || undefined,
+  // 微信小程序订阅消息（留空 = 微信通道整体关闭；模板 id 见微信公众平台「订阅消息」）
+  WX_APPID: process.env.WX_APPID || config.wxAppId || undefined,
+  WX_APPSECRET: process.env.WX_APPSECRET || config.wxAppSecret || undefined,
+  WX_TMPL_MESSAGE: process.env.WX_TMPL_MESSAGE || config.wxTmplMessage || undefined,
+  WX_TMPL_ATTENDANCE: process.env.WX_TMPL_ATTENDANCE || config.wxTmplAttendance || undefined,
+  WX_TMPL_HOMEWORK: process.env.WX_TMPL_HOMEWORK || config.wxTmplHomework || undefined,
+  // 云托管代理共享密钥（deploy/cloud-proxy 的 ARK_PROXY_SECRET；留空 = 不信任透传 IP）
+  ARK_PROXY_SECRET: process.env.ARK_PROXY_SECRET || config.proxySecret || undefined,
 }
 
 const app = createApp()

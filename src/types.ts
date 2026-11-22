@@ -12,6 +12,19 @@ export interface Env {
   AI_BASE_URL?: string
   AI_MODEL?: string
   AI?: WorkersAiBinding
+  /**
+   * 微信小程序订阅消息（wrangler secret / 自托管 config.json；未配置时微信通道关闭）。
+   * 模板 id 在微信公众平台「订阅消息」里申请后填入；字段名默认 thing1/thing2，模板结构不同时用 WX_FIELD_* 覆盖。
+   */
+  WX_APPID?: string
+  WX_APPSECRET?: string
+  WX_TMPL_MESSAGE?: string
+  WX_TMPL_ATTENDANCE?: string
+  WX_TMPL_HOMEWORK?: string
+  WX_FIELD_TITLE?: string
+  WX_FIELD_BODY?: string
+  /** 云托管代理共享密钥（deploy/cloud-proxy 携带）：匹配时信任 X-Ark-Client-IP 透传头 */
+  ARK_PROXY_SECRET?: string
 }
 
 /** Workers AI binding 的最小接口（wrangler.jsonc 的 ai.binding 注入） */

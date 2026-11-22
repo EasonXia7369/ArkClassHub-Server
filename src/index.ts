@@ -19,6 +19,7 @@ import { schoolRoutes } from './routes/school.js'
 import { gradeRoutes } from './routes/grades.js'
 import { examRoutes } from './routes/exams.js'
 import { aiRoutes } from './routes/ai.js'
+import { wxPushRoutes } from './routes/wx-push.js'
 
 /** 允许的前端来源：生产 Pages 域名 + 本地 Vite 开发服务器 + Windows 桌面端(Electron 自定义协议) */
 const ALLOWED_ORIGINS = ['https://ach.macrostar.top', 'http://localhost:5173', 'ark://app']
@@ -65,6 +66,7 @@ export function createApp() {
   app.route('/', gradeRoutes)
   app.route('/', examRoutes)
   app.route('/', aiRoutes)
+  app.route('/', wxPushRoutes)
 
   app.notFound((c) => c.json({ error: '接口不存在' }, 404))
 
