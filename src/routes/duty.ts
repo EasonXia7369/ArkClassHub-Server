@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import dayjs from 'dayjs'
 import type { AppContext } from '../types.js'
-import { authenticate, requireRole } from '../auth.js'
+import { authenticate, readGuard, requireRole, teacherGuard } from '../auth.js'
 import { audit } from '../audit.js'
 import { broadcastRefresh } from '../realtime.js'
 
@@ -18,6 +18,7 @@ dutyRoutes.get(
   '/api/classes/:id/duty',
   authenticate,
   requireRole('teacher', 'admin', 'student'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const week = mondayOf(c.req.query('week') ?? dayjs().format('YYYY-MM-DD'))
@@ -45,7 +46,7 @@ dutyRoutes.get(
 )
 
 /** 覆盖某天的值日安排。body: { week_start, weekday, members: [{student_id, role}] } */
-dutyRoutes.put('/api/classes/:id/duty', authenticate, requireRole('teacher', 'admin'), async (c) => {
+dutyRoutes.put('/api/classes/:id/duty', authenticate, requireRole('teacher', 'admin'), teacherGuard, async (c) => {
   const classId = Number(c.req.param('id'))
   const user = c.get('user')!
   const { week_start, weekday, members } = await c.req.json<{
@@ -102,6 +103,7 @@ dutyRoutes.get(
   '/api/classes/:id/duty/today',
   authenticate,
   requireRole('teacher', 'admin', 'student'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const today = dayjs().format('YYYY-MM-DD')

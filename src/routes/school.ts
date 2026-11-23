@@ -37,7 +37,8 @@ schoolRoutes.get('/api/school/overview', async (c) => {
     await c.env.DB.prepare(
       `SELECT g.id, g.name, g.sort,
               (SELECT COUNT(*) FROM classes cl WHERE cl.grade_id = g.id) AS class_count,
-              (SELECT GROUP_CONCAT(u.name, '、') FROM grade_directors gd JOIN users u ON u.id = gd.user_id WHERE gd.grade_id = g.id) AS directors
+              (SELECT GROUP_CONCAT(u.name, '、') FROM grade_directors gd JOIN users u ON u.id = gd.user_id WHERE gd.grade_id = g.id) AS directors,
+              (SELECT GROUP_CONCAT(gd.user_id) FROM grade_directors gd WHERE gd.grade_id = g.id) AS director_ids
        FROM grades g WHERE g.school_id = ?1 ORDER BY g.sort, g.id`,
     )
       .bind(schoolId)

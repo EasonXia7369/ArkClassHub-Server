@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { AppContext } from '../types.js'
-import { authenticate, requireRole } from '../auth.js'
+import { authenticate, readGuard, requireRole, teacherGuard } from '../auth.js'
 import { audit } from '../audit.js'
 import { broadcastRefresh } from '../realtime.js'
 import { pushClass, sideTask } from '../push.js'
@@ -26,6 +26,7 @@ homeworkRoutes.get(
   '/api/classes/:id/hw-records',
   authenticate,
   requireRole('teacher', 'admin', 'student'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const { from, to } = { from: c.req.query('from'), to: c.req.query('to') }
@@ -55,6 +56,7 @@ homeworkRoutes.put(
   '/api/classes/:id/hw-records',
   authenticate,
   requireRole('teacher', 'admin', 'student'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const user = c.get('user')!
@@ -117,6 +119,7 @@ homeworkRoutes.delete(
   '/api/classes/:id/hw-records',
   authenticate,
   requireRole('teacher', 'admin'),
+  teacherGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const user = c.get('user')!
@@ -142,6 +145,7 @@ homeworkRoutes.get(
   '/api/classes/:id/hw-tasks',
   authenticate,
   requireRole('teacher', 'admin', 'student'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const { from, to } = { from: c.req.query('from'), to: c.req.query('to') }
@@ -167,6 +171,7 @@ homeworkRoutes.put(
   authenticate,
   // 值日生是老师的助手：作业布置权限等同老师，操作按角色留痕
   requireRole('teacher', 'admin', 'student'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const user = c.get('user')!

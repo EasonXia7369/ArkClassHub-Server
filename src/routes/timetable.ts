@@ -1,12 +1,12 @@
 import { Hono } from 'hono'
 import dayjs from 'dayjs'
 import type { AppContext } from '../types.js'
-import { authenticate, requireRole } from '../auth.js'
+import { authenticate, readGuard, requireRole, teacherGuard } from '../auth.js'
 import { audit } from '../audit.js'
 
 export const timetableRoutes = new Hono<AppContext>()
 
-timetableRoutes.get('/api/classes/:id/timetable', authenticate, async (c) => {
+timetableRoutes.get('/api/classes/:id/timetable', authenticate, readGuard, async (c) => {
   const classId = Number(c.req.param('id'))
   const rows = (
     await c.env.DB.prepare(
@@ -20,7 +20,7 @@ timetableRoutes.get('/api/classes/:id/timetable', authenticate, async (c) => {
 })
 
 /** 今日课程（大板展示）。 */
-timetableRoutes.get('/api/classes/:id/timetable/today', authenticate, async (c) => {
+timetableRoutes.get('/api/classes/:id/timetable/today', authenticate, readGuard, async (c) => {
   const classId = Number(c.req.param('id'))
   const today = dayjs().format('YYYY-MM-DD')
   const wd = dayjs(today).day() === 0 ? 7 : dayjs(today).day()
@@ -40,16 +40,10 @@ timetableRoutes.put(
   '/api/classes/:id/timetable',
   authenticate,
   requireRole('teacher', 'admin'),
+  teacherGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const user = c.get('user')!
-    if (user.role === 'teacher') {
-      const ok = await c.env.DB
-        .prepare('SELECT 1 AS ok FROM classes WHERE id = ?1 AND teacher_id = ?2')
-        .bind(classId, user.userId)
-        .first()
-      if (!ok) return c.json({ error: '无权操作该班级' }, 403)
-    }
     const { weekday, periods } = await c.req.json<{
       weekday?: number
       periods?: Array<{ period: number; subject?: string; teacher?: string }>

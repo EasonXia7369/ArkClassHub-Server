@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { AppContext } from '../types.js'
-import { authenticate, requireRole } from '../auth.js'
+import { authenticate, readGuard, requireRole } from '../auth.js'
 import { audit } from '../audit.js'
 import { broadcastRefresh } from '../realtime.js'
 import { pushClass, sideTask } from '../push.js'
@@ -19,6 +19,7 @@ attendanceRoutes.get(
   '/api/classes/:id/attendance',
   authenticate,
   requireRole('teacher', 'admin', 'student'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const day = dateOf(c.req.query('day'))
@@ -44,6 +45,7 @@ attendanceRoutes.put(
   '/api/classes/:id/attendance',
   authenticate,
   requireRole('teacher', 'admin', 'student'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const user = c.get('user')!
@@ -155,6 +157,7 @@ attendanceRoutes.get(
   '/api/classes/:id/attendance/stats',
   authenticate,
   requireRole('teacher', 'admin'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const month = c.req.query('month') ?? ''

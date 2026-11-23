@@ -362,7 +362,10 @@ parentRoutes.get('/api/parent-lookup-code', async (c) => {
 parentRoutes.get('/api/parent/:key/messages', async (c) => {
   const bind = await resolveParentBind(c, c.req.param('key'))
   if (!bind) return c.json({ messages: [] })
-  const after = Number(c.req.query('after') ?? 0) || 0
+  // after 缺省 = 首拉全量；给了 after 才做增量（>0 的游标）。
+  // 用「是否传参」而非「值是否为 0」区分，避免 0 被当成游标把 id<=0 的历史整段吞掉。
+  const afterRaw = c.req.query('after')
+  const after = afterRaw === undefined || afterRaw === '' ? null : Number(afterRaw) || 0
   touchParentBind(c, bind.bindId)
   const rows = (
     await c.env.DB.prepare(
@@ -370,7 +373,8 @@ parentRoutes.get('/api/parent/:key/messages', async (c) => {
               rt.sender_name AS reply_name, rt.body AS reply_body
        FROM parent_messages m
        LEFT JOIN parent_messages rt ON rt.id = m.reply_to AND rt.deleted = 0
-       WHERE m.class_id = ?1 AND m.deleted = 0 AND m.id > ?2
+       WHERE m.class_id = ?1 AND m.deleted = 0
+         AND (?2 IS NULL OR m.id > ?2)
          AND (m.actor_student_id = ?3
               OR m.reply_to IN (SELECT id FROM parent_messages WHERE actor_student_id = ?3))
        ORDER BY m.id ASC LIMIT 300`,

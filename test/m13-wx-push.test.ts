@@ -18,6 +18,8 @@ const WX = {
   WX_TMPL_MESSAGE: 'TMPL-MSG',
   WX_TMPL_ATTENDANCE: 'TMPL-ATT',
   WX_TMPL_HOMEWORK: 'TMPL-HW',
+  // 家长留言走 ptk 绑定令牌（学号 + 身份证后六位换发），绑定接口需要该密钥
+  PARENT_ID_SECRET: 'test-parent-id-secret',
 }
 
 interface WxCall {
@@ -122,6 +124,8 @@ describe('微信订阅消息通道', () => {
   let classId: number
   let parentKey: string
   let stuId: number
+  /** 家长绑定令牌：留言接口凭它鉴权（学号+身份证后六位换发） */
+  let parentPtk: string
 
   beforeEach(() => {
     wxCalls = installWxFetchMock(secState)
@@ -195,6 +199,21 @@ describe('微信订阅消息通道', () => {
         headers: { authorization: `Bearer ${t1Token}` },
       })
     ).json().key
+
+    // 家长绑定：录入身份证后六位 → 换发 ptk 令牌（留言接口要求令牌鉴权）
+    await inject({
+      method: 'POST',
+      url: `/api/classes/${classId}/students/${stuId}/id-tail`,
+      payload: { tail: '12345X' },
+      headers: { authorization: `Bearer ${t1Token}` },
+    })
+    parentPtk = (
+      await inject({
+        method: 'POST',
+        url: `/api/parent/${parentKey}/bind`,
+        payload: { student_no: '01', id_tail: '12345X' },
+      })
+    ).json().token
 
     // 教师与管理员订阅微信通道（各自 openid）
     const tk = (
@@ -380,8 +399,8 @@ describe('微信订阅消息通道', () => {
     keepOnlyNonSend(wxCalls)
     const res = await inject({
       method: 'POST',
-      url: `/api/parent/${parentKey}/messages`,
-      payload: { body: '明天春游需要带水壶吗', student_no: '01', relation: '妈妈', push_token: pk },
+      url: `/api/parent/${parentKey}/messages?ptk=${encodeURIComponent(parentPtk)}`,
+      payload: { body: '明天春游需要带水壶吗', relation: '妈妈', push_token: pk },
     })
     expect(res.statusCode).toBe(200)
     // msgSecCheck 以家长 openid 调用（version 2）
@@ -403,8 +422,8 @@ describe('微信订阅消息通道', () => {
     ).json().push_token
     const res = await inject({
       method: 'POST',
-      url: `/api/parent/${parentKey}/messages`,
-      payload: { body: '含敏感词内容', student_no: '01', relation: '爸爸', push_token: pk },
+      url: `/api/parent/${parentKey}/messages?ptk=${encodeURIComponent(parentPtk)}`,
+      payload: { body: '含敏感词内容', relation: '爸爸', push_token: pk },
     })
     expect(res.statusCode).toBe(400)
     expect(res.json().error).toContain('安全检查')

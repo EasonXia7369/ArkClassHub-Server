@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import dayjs from 'dayjs'
 import type { AppContext } from '../types.js'
-import { authenticate, requireRole } from '../auth.js'
+import { authenticate, readGuard, requireRole, teacherGuard } from '../auth.js'
 import { audit } from '../audit.js'
 import { broadcastRefresh } from '../realtime.js'
 
@@ -54,6 +54,7 @@ leaveRoutes.get(
   '/api/classes/:id/leaves',
   authenticate,
   requireRole('teacher', 'admin', 'student'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const leaves = (
@@ -78,6 +79,7 @@ leaveRoutes.post(
   '/api/classes/:id/leaves',
   authenticate,
   requireRole('teacher', 'admin', 'student'),
+  readGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const user = c.get('user')!
@@ -88,6 +90,15 @@ leaveRoutes.post(
       reason?: string
       actor_student_id?: number
     }>()
+    // 学生申请请假：班级归属已由 readGuard 校验（只能操作本班）。
+    // 若前端带了 actor_student_id（值日生身份认领），必须落在本班——防止借他人 id 越级。
+    if (user.role === 'student' && actor_student_id) {
+      const claimed = await c.env.DB
+        .prepare('SELECT 1 AS ok FROM students WHERE id = ?1 AND class_id = ?2 AND active = 1')
+        .bind(actor_student_id, classId)
+        .first()
+      if (!claimed) return c.json({ error: '无权替该学生申请请假' }, 403)
+    }
     if (!student_id || !dateOf(from_day) || !dateOf(to_day)) {
       return c.json({ error: '学生、起止日期必填（YYYY-MM-DD）' }, 400)
     }
@@ -133,6 +144,7 @@ leaveRoutes.post(
   '/api/classes/:id/leaves/:lid/decision',
   authenticate,
   requireRole('teacher', 'admin'),
+  teacherGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const lid = Number(c.req.param('lid'))
@@ -181,6 +193,7 @@ leaveRoutes.delete(
   '/api/classes/:id/leaves/:lid',
   authenticate,
   requireRole('teacher', 'admin'),
+  teacherGuard,
   async (c) => {
     const classId = Number(c.req.param('id'))
     const lid = Number(c.req.param('lid'))

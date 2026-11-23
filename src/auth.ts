@@ -1,4 +1,4 @@
-import { Context, Next } from 'hono'
+import { Context, Next, type MiddlewareHandler } from 'hono'
 import type { AppContext, SessionUser } from './types.js'
 
 /* ---------- 密码 ---------- */
@@ -219,6 +219,33 @@ export async function canAccessClass(
     .bind(classId, user.userId)
     .first()
   return !!row
+}
+
+/* ---------- 班级归属守卫 ---------- */
+
+/**
+ * 统一班级归属校验中间件：`canAccessClass` 的 Hono 包装，供所有 /api/classes/:id/* 路由复用。
+ * - teacherGuard：仅 teacher/admin，且必须是班主任或协作教师
+ * - readGuard：teacher/admin/student，学生的 classId 必须等于目标班级
+ *
+ * 注意：`requireRole` 只回答"是不是老师"，**不回答"是不是这个班的老师"**。
+ * 任何带 :id 的班级级路由都必须挂上这两个之一，否则任意教师可越权读写别班数据。
+ */
+export type ClassGuard = MiddlewareHandler<AppContext>
+
+/** teacher/admin 权限 + 班级归属校验（student 仅限本人绑定班级）。 */
+export const teacherGuard: ClassGuard = async (c, next) => {
+  const classId = Number(c.req.param('id'))
+  const user = c.get('user')!
+  if (await canAccessClass(c.env.DB, user, classId)) return next()
+  return c.json({ error: '无权操作该班级' }, 403)
+}
+
+export const readGuard: ClassGuard = async (c, next) => {
+  const classId = Number(c.req.param('id'))
+  const user = c.get('user')
+  if (user && (await canAccessClass(c.env.DB, user, classId))) return next()
+  return c.json({ error: '无权访问该班级' }, 403)
 }
 
 /* ---------- 邀请码 ---------- */

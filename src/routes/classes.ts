@@ -6,7 +6,9 @@ import {
   createSession,
   defaultSchoolId,
   hashStudentPassword,
+  readGuard,
   requireRole,
+  teacherGuard,
   verifyPassword,
 } from '../auth.js'
 import { audit } from '../audit.js'
@@ -14,21 +16,6 @@ import { audit } from '../audit.js'
 export const classRoutes = new Hono<AppContext>()
 
 type MH = MiddlewareHandler<AppContext>
-
-/** teacher/admin 权限 + 班级归属校验（student 仅限本人绑定班级）。 */
-const teacherGuard: MH = async (c, next) => {
-  const classId = Number(c.req.param('id'))
-  const user = c.get('user')!
-  if (await canAccessClass(c.env.DB, user, classId)) return next()
-  return c.json({ error: '无权操作该班级' }, 403)
-}
-
-const readGuard: MH = async (c, next) => {
-  const classId = Number(c.req.param('id'))
-  const user = c.get('user')
-  if (user && (await canAccessClass(c.env.DB, user, classId))) return next()
-  return c.json({ error: '无权访问该班级' }, 403)
-}
 
 const teacher: [MH, MH, MH] = [authenticate, requireRole('teacher', 'admin'), teacherGuard]
 const reader: [MH, MH, MH] = [authenticate, requireRole('teacher', 'admin', 'student'), readGuard]
