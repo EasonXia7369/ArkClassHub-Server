@@ -10,6 +10,7 @@ import {
   defaultSchoolId,
 } from '../auth.js'
 import { audit } from '../audit.js'
+import { CONSENT_VERSION, consentOf, isCurrentVersion } from '../consent.js'
 
 export const authRoutes = new Hono<AppContext>()
 
@@ -69,7 +70,12 @@ authRoutes.post('/api/auth/activate', async (c) => {
   }
 
   const token = await createSession(c.env.DB, userId, role, null)
-  return c.json({ token, user: { id: userId, name: name.trim(), role, schoolId } })
+  return c.json({
+    token,
+    user: { id: userId, name: name.trim(), role, schoolId },
+    // 新账号从未同意过协议 → 前端登录后立即弹同意框
+    consent: consentOf({}),
+  })
 })
 
 authRoutes.post('/api/auth/login', async (c) => {
@@ -85,6 +91,8 @@ authRoutes.post('/api/auth/login', async (c) => {
   return c.json({
     token,
     user: { id: user.id, name: user.name, role: user.role, schoolId: user.school_id },
+    // 存量账号 consent_version 为空 → agreed:false，登录后补同意一次
+    consent: consentOf(user),
   })
 })
 
@@ -94,7 +102,33 @@ authRoutes.post('/api/auth/logout', authenticate, async (c) => {
 })
 
 authRoutes.get('/api/auth/me', authenticate, async (c) => {
-  return c.json({ user: c.get('user') })
+  const user = c.get('user')!
+  // 教师/管理员随会话返回协议同意状态；学生（一体机）不走同意流程，返回 null
+  const consent =
+    user.role === 'student'
+      ? null
+      : consentOf(
+          ((await c.env.DB.prepare('SELECT consent_version, consented_at FROM users WHERE id = ?1')
+            .bind(user.userId)
+            .first()) as { consent_version: string | null; consented_at: string | null } | null) ?? {},
+        )
+  return c.json({ user, consent })
+})
+
+/** 记录当前账号已同意最新版协议（协议改版后需重新同意）。 */
+authRoutes.post('/api/auth/consent', authenticate, async (c) => {
+  const user = c.get('user')!
+  if (user.role === 'student') return c.json({ error: '学生账号不适用' }, 403)
+  const { version } = await c.req.json<{ version?: string }>()
+  if (!isCurrentVersion(version)) {
+    // 前端缓存了旧版本号 → 让它刷新后重新阅读，避免误记为新版已同意
+    return c.json({ error: '协议已更新，请刷新页面后重新阅读', current: CONSENT_VERSION }, 409)
+  }
+  const at = new Date().toISOString()
+  await c.env.DB.prepare('UPDATE users SET consent_version = ?1, consented_at = ?2 WHERE id = ?3')
+    .bind(CONSENT_VERSION, at, user.userId)
+    .run()
+  return c.json({ ok: true, consent: { version: CONSENT_VERSION, agreed: true, consented_at: at } })
 })
 
 /** 修改自己的密码（教师/管理员；学生无独立密码）。 */

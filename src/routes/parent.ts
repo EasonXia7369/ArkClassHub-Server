@@ -6,6 +6,7 @@ import { broadcast } from '../realtime.js'
 import { pushClass, sideTask } from '../push.js'
 import { verifyWxPushToken, wxConfigured, wxMsgSecCheck } from '../push-wx.js'
 import { isoTs } from '../time.js'
+import { CONSENT_VERSION, consentOf, isCurrentVersion } from '../consent.js'
 
 /** 姓名脱敏：张三 → 张S（姓 + 名的拼音首字母，家长可读、外人不可读）。 */
 export function maskName(name: string): string {
@@ -89,6 +90,34 @@ export async function resolveParentBind(
   return { classId: cls.id, studentId: row.student_id, studentName: row.student_name, bindId: row.bind_id }
 }
 
+/** 家长绑定令牌的协议同意状态（挂在绑定记录上：换绑=同意见新记录，解绑=记录消失）。 */
+export async function parentConsentOf(
+  c: any,
+  bindId: number,
+): Promise<{ version: string; agreed: boolean; consented_at: string | null }> {
+  const row = (await c.env.DB.prepare(
+    'SELECT consent_version, consented_at FROM parent_binds WHERE id = ?1',
+  )
+    .bind(bindId)
+    .first()) as { consent_version: string | null; consented_at: string | null } | null
+  return consentOf(row ?? {})
+}
+
+/** 家长同意最新版协议。 */
+parentRoutes.post('/api/parent/:key/consent', async (c) => {
+  const { version } = await c.req.json<{ version?: string }>()
+  const bind = await resolveParentBind(c, c.req.param('key'))
+  if (!bind) return c.json({ error: '绑定已失效，请重新绑定' }, 401)
+  if (!isCurrentVersion(version)) {
+    return c.json({ error: '协议已更新，请刷新页面后重新阅读', current: CONSENT_VERSION }, 409)
+  }
+  const at = new Date().toISOString()
+  await c.env.DB.prepare('UPDATE parent_binds SET consent_version = ?1, consented_at = ?2 WHERE id = ?3')
+    .bind(CONSENT_VERSION, at, bind.bindId)
+    .run()
+  return c.json({ ok: true, consent: { version: CONSENT_VERSION, agreed: true, consented_at: at } })
+})
+
 /** 家长绑定：学号 + 身份证后六位 双凭据校验 → 签发长效令牌。限流防枚举。 */
 parentRoutes.post('/api/parent/:key/bind', async (c) => {
   const ip = c.req.header('CF-Connecting-IP') ?? c.req.header('X-Forwarded-For') ?? '?'
@@ -123,6 +152,8 @@ parentRoutes.post('/api/parent/:key/bind', async (c) => {
   return c.json({
     token,
     student: { name: maskName(stu.name), student_no: no },
+    // 新绑定记录尚未同意协议 → 前端立即弹同意框
+    consent: consentOf({}),
   })
 })
 
@@ -159,6 +190,8 @@ parentRoutes.get('/api/parent/:key', async (c) => {
   const bind = await resolveParentBind(c, key)
   const bound = bind ? { id: bind.studentId, name: mask(bind.studentName) } : null
   if (bind) touchParentBind(c, bind.bindId)
+  // 已绑定家长若未同意最新版协议 → 前端弹同意框（未绑定家长在绑定成功后另行处理）
+  const consent = bind ? await parentConsentOf(c, bind.bindId) : null
 
   const [tasks, attendance, timetable] = await Promise.all([
     c.env.DB
@@ -272,6 +305,7 @@ parentRoutes.get('/api/parent/:key', async (c) => {
     weekly,
     timetable,
     bound_student: bound,
+    consent,
   })
 })
 
