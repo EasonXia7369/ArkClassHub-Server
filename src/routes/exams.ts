@@ -211,7 +211,7 @@ examRoutes.get(
 
 /* ---------- 成绩读写 ---------- */
 
-/** 录分（全量替换模式）：body { scores: [{student_id, subject, score|null}] }，null=清除/缺考。 */
+/** 录分（全量替换模式）：body { scores: [{student_id, subject, score|null, class_rank?, school_rank?}] }，null=清除/缺考。 */
 examRoutes.put(
   '/api/classes/:id/exams/:eid/scores',
   authenticate,
@@ -222,7 +222,15 @@ examRoutes.put(
     const exam = await examOfClass(c.env.DB, classId, eid)
     if (!exam) return c.json({ error: '考试不存在' }, 404)
 
-    const { scores } = await c.req.json<{ scores?: Array<{ student_id?: number; subject?: string; score?: number | null }> }>()
+    const { scores } = await c.req.json<{
+      scores?: Array<{
+        student_id?: number
+        subject?: string
+        score?: number | null
+        class_rank?: number | null
+        school_rank?: number | null
+      }>
+    }>()
     if (!Array.isArray(scores)) return c.json({ error: 'scores 必须为数组' }, 400)
     if (scores.length > 3000) return c.json({ error: '单次最多 3000 条' }, 400)
 
@@ -233,7 +241,21 @@ examRoutes.put(
       ).results.map((r: any) => r.id),
     )
 
-    const rows: Array<{ student_id: number; subject: string; score: number; full: number }> = []
+    /** 排名归一：非正整数一律视为未提供（null），避免脏值写入 */
+    const rankOf = (v: unknown): number | null => {
+      if (v === null || v === undefined || v === '') return null
+      const n = Number(v)
+      return Number.isFinite(n) && n >= 1 && n <= 9999 ? Math.round(n) : null
+    }
+
+    const rows: Array<{
+      student_id: number
+      subject: string
+      score: number
+      full: number
+      class_rank: number | null
+      school_rank: number | null
+    }> = []
     for (const item of scores) {
       const sid = Number(item?.student_id ?? 0)
       const sub = (item?.subject ?? '').trim()
@@ -247,7 +269,14 @@ examRoutes.put(
       if (!Number.isFinite(v) || v < 0 || v > full) {
         return c.json({ error: `分数越界：学生 ${sid} ${sub} ${sc}（满分 ${full}）` }, 400)
       }
-      rows.push({ student_id: sid, subject: sub, score: v, full })
+      rows.push({
+        student_id: sid,
+        subject: sub,
+        score: v,
+        full,
+        class_rank: rankOf(item?.class_rank),
+        school_rank: rankOf(item?.school_rank),
+      })
     }
 
     // 全量替换：清掉旧成绩再写入本次提交的非空行
@@ -256,9 +285,10 @@ examRoutes.put(
       ...rows.map((r) =>
         c.env.DB
           .prepare(
-            'INSERT INTO exam_scores (exam_id, student_id, subject, score, full_score) VALUES (?1,?2,?3,?4,?5)',
+            `INSERT INTO exam_scores (exam_id, student_id, subject, score, full_score, class_rank, school_rank)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)`,
           )
-          .bind(eid, r.student_id, r.subject, r.score, r.full),
+          .bind(eid, r.student_id, r.subject, r.score, r.full, r.class_rank, r.school_rank),
       ),
     ])
     return c.json({ ok: true, written: rows.length })
@@ -276,17 +306,26 @@ export async function buildExamDetail(db: D1Database, classId: number, eid: numb
       .all<any>()
   ).results
   const scoreRows = (
-    await db.prepare('SELECT student_id, subject, score, full_score FROM exam_scores WHERE exam_id = ?1')
+    await db
+      .prepare(
+        'SELECT student_id, subject, score, full_score, class_rank, school_rank FROM exam_scores WHERE exam_id = ?1',
+      )
       .bind(eid)
       .all<any>()
   ).results
 
-  // 矩阵：student -> subject -> score
+  // 矩阵：student -> subject -> score；另存学校口径排名（可能为空）
   const byStudent = new Map<number, Map<string, number | null>>()
+  const rankByStudent = new Map<number, Map<string, { class: number | null; school: number | null }>>()
   for (const r of scoreRows) {
     const m = byStudent.get(r.student_id) ?? new Map<string, number | null>()
     m.set(r.subject, r.score)
     byStudent.set(r.student_id, m)
+    if (r.class_rank !== null || r.school_rank !== null) {
+      const rm = rankByStudent.get(r.student_id) ?? new Map<string, { class: number | null; school: number | null }>()
+      rm.set(r.subject, { class: r.class_rank, school: r.school_rank })
+      rankByStudent.set(r.student_id, rm)
+    }
   }
 
   const subjects = exam.subjects
@@ -296,12 +335,16 @@ export async function buildExamDetail(db: D1Database, classId: number, eid: numb
     seq: number
     active: boolean
     scores: Record<string, number | null>
+    /** 学校成绩单给的逐科排名（教师端展示用；家长端只取 school_rank） */
+    ranks: Record<string, { class: number | null; school: number | null }>
     total: number | null
     absent: string[]
     rank: number | null
   }> = students.map((s) => {
     const m = byStudent.get(s.id) ?? new Map<string, number | null>()
+    const rm = rankByStudent.get(s.id) ?? new Map<string, { class: number | null; school: number | null }>()
     const scores: Record<string, number | null> = {}
+    const ranks: Record<string, { class: number | null; school: number | null }> = {}
     let total = 0
     let counted = 0
     const absent: string[] = []
@@ -309,6 +352,7 @@ export async function buildExamDetail(db: D1Database, classId: number, eid: numb
       const has = m.has(sub.subject)
       const v = m.get(sub.subject)
       scores[sub.subject] = has ? (v as number | null) : null
+      ranks[sub.subject] = rm.get(sub.subject) ?? { class: null, school: null }
       if (has && v !== null && v !== undefined) {
         total += v
         counted++
@@ -322,6 +366,7 @@ export async function buildExamDetail(db: D1Database, classId: number, eid: numb
       seq: s.seq,
       active: !!s.active,
       scores,
+      ranks,
       total: counted ? Math.round(total * 10) / 10 : null,
       absent,
       rank: null,
@@ -368,7 +413,7 @@ examRoutes.get(
   },
 )
 
-/* ---------- 家长侧（凭 parent_key + 学号绑定，无排名） ---------- */
+/* ---------- 家长侧（凭 parent_key + 绑定令牌；只给分数/均值/校排名，不给班内排名） ---------- */
 
 examRoutes.get('/api/parent/:key/exams', async (c) => {
   const key = c.req.param('key')
@@ -384,15 +429,16 @@ examRoutes.get('/api/parent/:key/exams', async (c) => {
       .all<any>()
   ).results.map((r) => ({ id: r.id, name: r.name, day: r.day, subjects: parseSubjects(r.subjects_json) }))
 
-  // 孩子的分数 + 每科班级均值（无排名）
+  // 孩子的分数 + 每科班级均值 + 学校官方校排名（刻意不给班内排名：与教师端口径区分）
   const examItems = []
   for (const e of exams) {
     const rows = (
-      await c.env.DB.prepare('SELECT student_id, subject, score FROM exam_scores WHERE exam_id = ?1')
+      await c.env.DB
+        .prepare('SELECT student_id, subject, score, school_rank FROM exam_scores WHERE exam_id = ?1')
         .bind(e.id)
         .all<any>()
     ).results
-    const scores: Record<string, { score: number | null; full: number; avg: number | null }> = {}
+    const scores: Record<string, { score: number | null; full: number; avg: number | null; school_rank: number | null }> = {}
     for (const sub of e.subjects) {
       const vals = rows.filter((r: any) => r.subject === sub.subject && r.score !== null).map((r: any) => r.score as number)
       const mine = rows.find((r: any) => r.student_id === stu.id && r.subject === sub.subject)
@@ -400,6 +446,7 @@ examRoutes.get('/api/parent/:key/exams', async (c) => {
         score: mine && mine.score !== null ? mine.score : null,
         full: sub.full,
         avg: vals.length ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 10) / 10 : null,
+        school_rank: mine?.school_rank ?? null,
       }
     }
     examItems.push({ id: e.id, name: e.name, day: e.day, scores })
@@ -680,26 +727,70 @@ examRoutes.post(
     }
 
     try {
-      const out = await aiComplete(
-        c.env,
-        c.env.DB,
-        '你是成绩单解析器。用户会给一段格式任意的考试成绩单原文（可能来自 Excel 复制、CSV、手排文字，列顺序不定、可能有备注/统计/表头行）。请解析并输出 JSON：{"subjects":[{"subject":"科目名","full":满分数字}],"rows":[{"name":"学生姓名","scores":{"科目":分数或null}}]}。要求：1) 科目名尽量与考试科目对齐：' +
-          JSON.stringify(exam.subjects.map((s) => s.subject)) +
-          '（对不上的用原文科目名）；2) 满分从列头推断（如"语文(150)"→150），否则 100；3) 忽略表头行、合计/平均分等统计行；4) 分数必须是数字或缺考标记 null；5) 学生姓名保留原文写法。直接输出 JSON，不要多余文字。',
-        raw,
-        { maxTokens: 3000, timeoutMs: 60000 },
-      )
+      const expected = exam.subjects.map((s) => `${s.subject}(满分${s.full})`).join('、')
+      const system = [
+        '你是成绩单解析器。用户会给一段格式任意的考试成绩单原文（Excel 复制、CSV、手排文字均可）。',
+        '',
+        '【最重要：识别多列科目组】',
+        '很多成绩单每个科目横跨 2~3 列，例如「语文 | 班名 | 校名」或「语文 | 分数 | 班名 | 校名」，',
+        '也可能是「分数 | 班名 | 校名」三列重复出现而科目名只在合并表头里出现过一次。',
+        '判别方法：看表头（可能分多行），找出每个科目覆盖哪几列；',
+        '同一科目组内，按列头文字区分：',
+        '  - 列头含「分」「成绩」「得分」→ 分数列',
+        '  - 列头含「班名」「班级排名」「班排」→ 班级排名列',
+        '  - 列头含「校名」「年级排名」「校排」「级名」→ 校级排名列',
+        '看不到列头时按数值特征推断：分数通常较大（≥30），排名通常较小（≤60 且为整数）。',
+        '**同一行里连续出现「大数 小数 小数」的模式，极可能是「分数 班名 校名」。**',
+        '',
+        '【输出格式】严格输出 JSON，不要任何多余文字、不要 markdown 代码块：',
+        '{"subjects":[{"subject":"科目名","full":满分}],',
+        ' "rows":[{"name":"学生姓名",',
+        '          "scores":{"科目":分数或null},',
+        '          "class_ranks":{"科目":班名或null},',
+        '          "school_ranks":{"科目":校名或null}}]}',
+        '',
+        '【规则】',
+        `1) 科目名尽量对齐本场考试的科目：${expected}；本场未考的科目（如成绩单里有但考试没配）忽略。`,
+        '2) 满分优先从列头推断（如「数学(150)」→150，「语文/150分」→150）；推不出就用上面给的满分。',
+        '3) 跳过纯表头行、合计/平均/最高分等统计行、序号列、学籍号列、考试号列。',
+        '4) 分数必须是数字；缺考、免考、空单元格、"-"、"/"、"—" 一律存 null（不要存 0）。',
+        '5) 排名必须是正整数；没有就给 null。**绝对不要把排名当成分数，也不要把分数当成排名。**',
+        '6) 姓名保留原文写法（不要脱敏、不要补全）。',
+        '7) 顺序保持原文顺序。',
+      ].join('\n')
+      const out = await aiComplete(c.env, c.env.DB, system, raw, {
+        maxTokens: 8000,
+        timeoutMs: 90000,
+      })
       const parsed = extractJson<any>(out)
       if (!parsed || !Array.isArray(parsed.subjects) || !Array.isArray(parsed.rows)) {
         return c.json({ error: 'AI 未能解析出有效结构，请检查成绩单内容或调整后重试' }, 502)
       }
-      const subjects = parsed.subjects
+      type SubMeta = { subject: string; full: number }
+      const subjectList: SubMeta[] = parsed.subjects
         .filter((s: any) => s && typeof s.subject === 'string' && s.subject.trim())
         .map((s: any) => ({
-          subject: String(s.subject).trim().slice(0, 16),
-          full: Math.round(Math.max(1, Math.min(1000, Number(s.full) || 100))),
+          subject: String(s.subject).trim().slice(0, 16) as string,
+          full: Math.round(Math.max(1, Math.min(1000, Number(s.full) || 100))) as number,
         }))
         .slice(0, 20)
+      const subjects = subjectList
+
+      const fullOf = new Map<string, number>()
+      for (const s of subjectList) fullOf.set(s.subject, s.full)
+      /** 分数归一：非法/越界 → null；缺考标记 → null */
+      const numOf = (v: unknown, full: number): number | null => {
+        if (v === null || v === undefined || v === '') return null
+        if (typeof v === 'string' && !/^-?\d+(\.\d+)?$/.test(v.trim())) return null
+        const n = Number(v)
+        if (!Number.isFinite(n) || n < 0 || n > full) return null
+        return n
+      }
+      const rankOf = (v: unknown): number | null => {
+        if (v === null || v === undefined || v === '') return null
+        const n = Number(v)
+        return Number.isFinite(n) && n >= 1 && n <= 9999 ? Math.round(n) : null
+      }
 
       const rows = parsed.rows
         .filter((r: any) => r && typeof r.name === 'string' && r.name.trim())
@@ -707,14 +798,48 @@ examRoutes.post(
         .map((r: any) => {
           const sid = nameMatch(r.name)
           const scores: Record<string, number | null> = {}
-          for (const sub of subjects) {
-            const v = r.scores?.[sub.subject]
-            scores[sub.subject] = v === undefined || v === null ? null : Number(v)
+          const classRanks: Record<string, number | null> = {}
+          const schoolRanks: Record<string, number | null> = {}
+          for (const sub of subjectList) {
+            const full = fullOf.get(sub.subject) ?? 100
+            const rawScore = r.scores?.[sub.subject]
+            const sc = numOf(rawScore, full)
+            // 仅做安全清洗，不猜测交换（交换有丢数据风险，异常值前端会标红让人核对）
+            let cr = rankOf(r.class_ranks?.[sub.subject])
+            let sr = rankOf(r.school_ranks?.[sub.subject])
+            // 排名不可能大于班级人数，但这里没有班级人数上下文，只挡明显的分数误入（>full）
+            if (cr !== null && cr > 9999) cr = null
+            if (sr !== null && sr > 9999) sr = null
+
+            scores[sub.subject] = sc
+            classRanks[sub.subject] = cr
+            schoolRanks[sub.subject] = sr
           }
-          return { name: String(r.name).trim(), student_id: sid, scores, matched: sid !== null }
+          return {
+            name: String(r.name).trim(),
+            student_id: sid,
+            scores,
+            class_ranks: classRanks,
+            school_ranks: schoolRanks,
+            matched: sid !== null,
+          }
         })
 
-      return c.json({ subjects, rows, total_matched: rows.filter((r: any) => r.matched).length })
+      // 统计解析质量，前端据此提示用户重点核对
+      const withScore = rows.filter((r: any) => Object.values(r.scores).some((v) => v !== null)).length
+      const withSchoolRank = rows.filter((r: any) =>
+        Object.values(r.school_ranks).some((v) => v !== null),
+      ).length
+
+      return c.json({
+        subjects,
+        rows,
+        total_matched: rows.filter((r: any) => r.matched).length,
+        total_rows: rows.length,
+        rows_with_score: withScore,
+        rows_with_school_rank: withSchoolRank,
+        exam_subjects: exam.subjects,
+      })
     } catch (e: any) {
       return c.json({ error: e instanceof AiError ? e.message : 'AI 调用失败' }, 502)
     }
