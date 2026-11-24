@@ -168,7 +168,7 @@ examRoutes.get(
         .all<any>()
     ).results
 
-    // 班级均值序列
+    // 班级均值序列（含总分均值与各科满分，供前端画总分线与归一化）
     const series = exams.map((e) => {
       const subjectAvgs: Record<string, number | null> = {}
       for (const sub of e.subjects) {
@@ -177,7 +177,19 @@ examRoutes.get(
           .map((r: any) => r.score as number)
         subjectAvgs[sub.subject] = vals.length ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 10) / 10 : null
       }
-      return { exam_id: e.id, name: e.name, day: e.day, subjectAvgs }
+      const totalFull = e.subjects.reduce((a: number, s: any) => a + s.full, 0)
+      // 总分均值：各科均值之和（缺考科目按 0 计，与「人均总分」口径一致）
+      const avgTotal = Object.values(subjectAvgs).reduce<number>((a, v) => a + (v ?? 0), 0)
+      const hasAny = Object.values(subjectAvgs).some((v) => v !== null)
+      return {
+        exam_id: e.id,
+        name: e.name,
+        day: e.day,
+        subjectAvgs,
+        totalAvg: hasAny ? Math.round(avgTotal * 10) / 10 : null,
+        totalFull,
+        subjects: e.subjects.map((s: any) => ({ subject: s.subject, full: s.full })),
+      }
     })
 
     // 每生序列
