@@ -386,6 +386,14 @@ export async function buildExamDetail(db: D1Database, classId: number, eid: numb
   })
   for (const r of rows) r.rank = rankMap.get(r.id) ?? null
 
+  // 按班级排名排序（同分同名次时按 seq 稳定次序）；无成绩者（缺考/未录）排末尾并按 seq
+  rows.sort((a, b) => {
+    const ra = a.rank ?? Number.POSITIVE_INFINITY
+    const rb = b.rank ?? Number.POSITIVE_INFINITY
+    if (ra !== rb) return ra - rb
+    return a.seq - b.seq
+  })
+
   const stats: Record<string, ReturnType<typeof statOf>> = {}
   for (const sub of subjects) {
     stats[sub.subject] = statOf(rows.map((r) => r.scores[sub.subject]), sub.full)
@@ -414,8 +422,10 @@ examRoutes.get(
   },
 )
 
-/* ---------- 家长侧（凭 parent_key + 绑定令牌；只给分数/均值/校排名，不给班内排名） ---------- */
-
+/**
+ * 家长侧（凭 parent_key + 绑定令牌）：
+ * 只给「自己孩子」的分数 / 班级均值 / 学校官方校排名 / AI 点评；不给班内排名与其他学生任何数据。
+ */
 examRoutes.get('/api/parent/:key/exams', async (c) => {
   const key = c.req.param('key')
   const bind = await resolveParentBind(c, key)
@@ -429,6 +439,22 @@ examRoutes.get('/api/parent/:key/exams', async (c) => {
       .bind(clsId)
       .all<any>()
   ).results.map((r) => ({ id: r.id, name: r.name, day: r.day, subjects: parseSubjects(r.subjects_json) }))
+
+  // 教师为该孩子写/生成的 AI 点评（按考试分组；只取绑定学生本人的）
+  const commentRows = exams.length
+    ? (
+        await c.env.DB.prepare(
+          `SELECT exam_id, text, updated_at FROM exam_comments
+           WHERE student_id = ?1 AND exam_id IN (${exams.map(() => '?').join(',')})`,
+        )
+          .bind(stu.id, ...exams.map((e) => e.id))
+          .all<any>()
+      ).results
+    : []
+  const commentOf = new Map<number, { text: string; updated_at: string }>()
+  for (const r of commentRows) {
+    commentOf.set(r.exam_id, { text: r.text, updated_at: isoTs(r.updated_at) })
+  }
 
   // 孩子的分数 + 每科班级均值 + 学校官方校排名（刻意不给班内排名：与教师端口径区分）
   const examItems = []
@@ -450,14 +476,14 @@ examRoutes.get('/api/parent/:key/exams', async (c) => {
         school_rank: mine?.school_rank ?? null,
       }
     }
-    examItems.push({ id: e.id, name: e.name, day: e.day, scores })
+    // AI 点评：只有老师确实生成/撰写过才有，否则 null
+    examItems.push({ id: e.id, name: e.name, day: e.day, scores, comment: commentOf.get(e.id) ?? null })
   }
 
   return c.json({
     student: { name: maskName(stu.name) },
     exams: examItems,
-  },
-  )
+  })
 })
 
 /* ---------- AI：考试总结 / 个人点评 / 智能导入（教师手动触发） ---------- */
