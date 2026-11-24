@@ -518,23 +518,39 @@ examRoutes.post(
     if (!detail) return c.json({ error: '考试不存在' }, 404)
 
     // 脱敏：统计里的分数段不含姓名；rows 姓名 mask；排名不给出（避免 AI 写进总结）
+    const totalFull = detail.exam.subjects.reduce((a: number, s: any) => a + s.full, 0)
+    // passRate / excellentRate 已是 0~100 的百分数；平均得分率另算
+    const pct = (v: unknown) => (typeof v === 'number' ? `${v}%` : '—')
     const data = {
       考试: detail.exam.name,
       日期: detail.exam.day,
       科目统计: Object.fromEntries(
-        detail.exam.subjects.map((s: any) => [
-          `${s.subject}(满分${s.full})`,
-          {
-            平均: detail.stats[s.subject]?.avg,
-            最高: detail.stats[s.subject]?.max,
-            最低: detail.stats[s.subject]?.min,
-            及格率: detail.stats[s.subject]?.passRate,
-            优秀率: detail.stats[s.subject]?.excellentRate,
-            缺考: detail.stats[s.subject]?.absent,
-          },
-        ]),
+        detail.exam.subjects.map((s: any) => {
+          const st = detail.stats[s.subject]
+          const avgRate =
+            st?.avg != null && s.full ? Math.round((st.avg / s.full) * 1000) / 10 : null
+          return [
+            `${s.subject}(满分${s.full})`,
+            {
+              平均: st?.avg,
+              平均得分率: pct(avgRate),
+              最高: st?.max,
+              最低: st?.min,
+              及格率: pct(st?.passRate),
+              优秀率: pct(st?.excellentRate),
+              有效人数: st?.count,
+              缺考人数: st?.absent,
+            },
+          ]
+        }),
       ),
-      总分: detail.stats['总分'],
+      总分: {
+        平均: detail.stats['总分']?.avg,
+        满分: totalFull,
+        及格率: pct(detail.stats['总分']?.passRate),
+        优秀率: pct(detail.stats['总分']?.excellentRate),
+        缺考人数: detail.stats['总分']?.absent,
+      },
       学生明细: detail.students.map((r) => ({
         姓名: maskName(r.name),
         各科: r.scores,
@@ -555,7 +571,30 @@ examRoutes.post(
       const text = await aiComplete(
         c.env,
         c.env.DB,
-        '你是班级考试分析助手。根据用户提供的脱敏考试统计，输出 JSON：{"overall":"2~3 句整体表现","strengths":["强项科目及表现",1~3条],"weaknesses":["薄弱科目或问题",1~3条],"attention":[{"name":"脱敏姓名","reason":"一句话原因"}],"actions":["给老师的建议动作",1~3条]}。要求：全中文；只基于数据绝不编造；attention 最多 3 人（明显低于班级均分或多科缺考）；overall 面向班主任。直接输出 JSON，不要多余文字。',
+        [
+          '你是班级考试分析助手，为班主任写结构化考试总结。',
+          '',
+          '【数据口径】姓名已脱敏为「姓+拼音首字母」，直接沿用，不要还原、不要编造。',
+          '「及格率/优秀率/平均得分率」均为百分数，「有效人数」= 实考人数，「缺考人数」单列。',
+          '「学生明细」只含本人各科分数，无排名——不要写「第几名」。',
+          '',
+          '【输出】严格 JSON，字段固定：',
+          '{',
+          '  "overall": "2~3 句整体表现（带上总分均值、及格率等关键数字）",',
+          '  "strengths": ["强项科目 + 具体依据（均分/得分率/优秀率）", 1~3 条],',
+          '  "weaknesses": ["薄弱科目或问题 + 具体依据", 1~3 条],',
+          '  "attention": [{"name":"脱敏姓名","reason":"一句话原因（必须引用该生实际分数或缺失科目）"}, 最多 3 人],',
+          '  "actions": ["给老师的可执行建议（针对弱项科目/需关注学生）", 1~3 条]',
+          '}',
+          '',
+          '【判断标准】',
+          '　- 强弱科目看「平均得分率」横向对比，不要只看绝对分（不同科目满分不同）。',
+          '　- 及格率 <60% 或优秀率 <10% 的科目优先列为 weakness。',
+          '　- attention 只挑「明显低于班级均分」或「多科缺考」的学生，最多 3 人，宁缺毋滥。',
+          '　- 全体无异常时，weaknesses / attention 可给空数组，不要硬凑。',
+          '',
+          '【硬性要求】全中文；数字必须与数据一致，不得推算或编造；不要 markdown 代码块；不要任何 JSON 以外的文字。',
+        ].join('\n'),
         JSON.stringify(data),
         { maxTokens: 800 },
       )
@@ -646,20 +685,44 @@ examRoutes.post(
       history.push({ 考试: e.name, 日期: e.day, 各科, 总分: counted ? Math.round(total * 10) / 10 : null })
     }
 
+    // 预计算「与本班均分的差」与「与上次相比的变化」，避免 AI 自行心算出错
+    const round1 = (v: number) => Math.round(v * 10) / 10
     const 本次 = Object.fromEntries(
-      detail.exam.subjects.map((s: any) => [
-        s.subject,
-        {
-          分数: stu.scores[s.subject],
-          满分: s.full,
-          班级均分: detail.stats[s.subject]?.avg,
-        },
-      ]),
+      detail.exam.subjects.map((s: any) => {
+        const score = stu.scores[s.subject]
+        const avg = detail.stats[s.subject]?.avg ?? null
+        const diff = score != null && avg != null ? round1(score - avg) : null
+        // 上一次该科有分的那场，用于「进步/退步」判断
+        let prevScore: number | null = null
+        let prevName = ''
+        for (let i = history.length - 1; i >= 0; i--) {
+          const h = history[i]
+          if (h.考试 === detail.exam.name && h.日期 === detail.exam.day) continue
+          const v = h.各科[s.subject]
+          if (v != null) {
+            prevScore = v
+            prevName = h.考试
+            break
+          }
+        }
+        return [
+          s.subject,
+          {
+            分数: score,
+            满分: s.full,
+            班级均分: avg,
+            高出均分: diff != null ? (diff >= 0 ? `+${diff}` : `${diff}`) : null,
+            上次分数: prevScore,
+            较上次: prevScore != null && score != null ? (score - prevScore >= 0 ? `+${round1(score - prevScore)}` : `${round1(score - prevScore)}`) : null,
+            上次考试: prevName || null,
+          },
+        ]
+      }),
     )
     const data = {
       学生姓名: stu.name,
       班级人数: detail.students.length,
-      本次考试: { 名称: detail.exam.name, 日期: detail.exam.day, 各科: 本次, 总分: stu.total },
+      本次考试: { 名称: detail.exam.name, 日期: detail.exam.day, 各科: 本次, 总分: stu.total, 缺考科目: stu.absent },
       历次考试: history,
       老师补充说明: (extra_note ?? '').trim().slice(0, 200) || undefined,
     }
@@ -668,7 +731,23 @@ examRoutes.post(
       const text = await aiComplete(
         c.env,
         c.env.DB,
-        '你是班主任。请根据数据为学生写一段发给家长的考试成绩评语。要求：1) 全中文 80~150 字；2) 直接称呼学生姓名；3) 结构：先肯定亮点或进步（对照班级均分与历次趋势），再指出薄弱科目，最后给一句可操作的建议；4) 语气温和具体、不空话套话，只基于数据不编造；5) 若有老师补充说明请自然融入。直接输出评语正文，不要引号和标题。',
+        [
+          '你是班主任，为学生写一段发给家长的考试成绩评语。',
+          '',
+          '【数据读法】',
+          '　- 「高出均分」已算好：正数表示高于班级均分，负数表示低于（如 +8.5 / -6）。直接引用，不要自己再算。',
+          '　- 「较上次」是该科与上一次有分考试的差值（如 +5 / -12），用于判断进步或退步；为 null 表示无可比记录。',
+          '　- 「缺考科目」列出本次没考/没录的科目，若不为空需提一句（如补考安排），不要当作 0 分评价。',
+          '　- 「历次考试」是该生全部考试记录，可用来描述长期趋势（如「连续两次进步」）。',
+          '',
+          '【写法】80~150 字，一段连贯话，直接称呼学生姓名（用「你」或直接名字，不要「该生」）。',
+          '　1) 先肯定：挑一个最实在的亮点——高于均分最多的科目、进步最大的科目，或整体稳中有升，带上具体数字。',
+          '　2) 再指出：低于均分较多的科目或有退步的科目，同样带数字，语气客观不指责。',
+          '　3) 最后一句可操作建议：针对薄弱科目，具体到「怎么做」（如「每天 15 分钟复盘错题」），不要「继续努力」这类空话。',
+          '　4) 若老师有补充说明，自然融进正文，不要单列成一句。',
+          '',
+          '【硬性要求】只基于给定数据，数字必须与数据一致，不得编造或推算未给出的分数；语气温和具体；不要引号、标题、称呼语（如「家长您好」除外，可选）。直接输出正文。',
+        ].join('\n'),
         JSON.stringify(data),
         { maxTokens: 400 },
       )
