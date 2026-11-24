@@ -3,6 +3,7 @@ import type { AppContext } from '../types.js'
 import { authenticate, requireRole } from '../auth.js'
 import { isoTs } from '../time.js'
 import { maskName, resolveParentBind, touchParentBind } from './parent.js'
+import { fingerprintOf, peekAiOutput, readAiOutput, writeAiOutput } from '../ai-cache.js'
 
 export const examRoutes = new Hono<AppContext>()
 
@@ -463,6 +464,19 @@ examRoutes.get('/api/parent/:key/exams', async (c) => {
 
 import { resolveAiConfig, aiComplete, extractJson, AiError } from '../ai.js'
 
+/** 读取已缓存的考试总结（页面加载时展示上次结果，不触发 AI）。 */
+examRoutes.get(
+  '/api/classes/:id/exams/:eid/summary',
+  authenticate,
+  requireRole('teacher', 'admin'),
+  async (c) => {
+    const classId = Number(c.req.param('id'))
+    const eid = Number(c.req.param('eid'))
+    const hit = await peekAiOutput<{ summary: any }>(c.env.DB, classId, 'exam_summary', `exam:${eid}`)
+    return c.json(hit ? { summary: hit.payload.summary, cached: true, created_at: hit.created_at } : { summary: null })
+  },
+)
+
 /** AI 考试总结：结构化分块（整体/强项/弱项/需关注/建议），学生姓名脱敏出域。 */
 examRoutes.post(
   '/api/classes/:id/exams/:eid/summary',
@@ -473,6 +487,7 @@ examRoutes.post(
     if (cfg.kind === 'none') return c.json({ error: 'AI 未配置' }, 503)
     const classId = Number(c.req.param('id'))
     const eid = Number(c.req.param('eid'))
+    const { force } = await c.req.json<{ force?: boolean }>().catch(() => ({ force: false }))
     const detail = await buildExamDetail(c.env.DB, classId, eid)
     if (!detail) return c.json({ error: '考试不存在' }, 404)
 
@@ -502,6 +517,14 @@ examRoutes.post(
       })),
     }
 
+    // 缓存：同一场考试的统计没变就复用（改了成绩指纹自然变，自动重新生成）
+    const scope = `exam:${eid}`
+    const fp = await fingerprintOf(data)
+    if (!force) {
+      const hit = await readAiOutput<{ summary: any }>(c.env.DB, classId, 'exam_summary', scope, fp)
+      if (hit) return c.json({ summary: hit.payload.summary, cached: true, created_at: hit.created_at })
+    }
+
     try {
       const text = await aiComplete(
         c.env,
@@ -512,17 +535,17 @@ examRoutes.post(
       )
       const parsed = extractJson<any>(text)
       if (!parsed || typeof parsed !== 'object') return c.json({ error: 'AI 返回格式异常，请重试' }, 502)
-      return c.json({
-        summary: {
-          overall: String(parsed.overall ?? ''),
-          strengths: (Array.isArray(parsed.strengths) ? parsed.strengths : []).map(String).slice(0, 5),
-          weaknesses: (Array.isArray(parsed.weaknesses) ? parsed.weaknesses : []).map(String).slice(0, 5),
-          attention: (Array.isArray(parsed.attention) ? parsed.attention : [])
-            .filter((a: any) => a && a.name && a.reason)
-            .slice(0, 5),
-          actions: (Array.isArray(parsed.actions) ? parsed.actions : []).map(String).slice(0, 5),
-        },
-      })
+      const summary = {
+        overall: String(parsed.overall ?? ''),
+        strengths: (Array.isArray(parsed.strengths) ? parsed.strengths : []).map(String).slice(0, 5),
+        weaknesses: (Array.isArray(parsed.weaknesses) ? parsed.weaknesses : []).map(String).slice(0, 5),
+        attention: (Array.isArray(parsed.attention) ? parsed.attention : [])
+          .filter((a: any) => a && a.name && a.reason)
+          .slice(0, 5),
+        actions: (Array.isArray(parsed.actions) ? parsed.actions : []).map(String).slice(0, 5),
+      }
+      await writeAiOutput(c.env.DB, classId, 'exam_summary', scope, fp, { summary }, cfg.model ?? null)
+      return c.json({ summary, cached: false })
     } catch (e: any) {
       return c.json({ error: e instanceof AiError ? e.message : 'AI 调用失败' }, 502)
     }

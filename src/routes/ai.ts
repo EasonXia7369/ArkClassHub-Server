@@ -5,6 +5,7 @@ import { authenticate, requireRole } from '../auth.js'
 import { resolveAiConfig, aiComplete, aiCompleteWith, extractJson, AiError } from '../ai.js'
 import { collectReport } from './reports.js'
 import { maskName } from './parent.js'
+import { fingerprintOf, peekAiOutput, readAiOutput, writeAiOutput } from '../ai-cache.js'
 
 export const aiRoutes = new Hono<AppContext>()
 
@@ -26,10 +27,10 @@ aiRoutes.post(
   authenticate,
   requireRole('teacher', 'admin'),
   async (c) => {
-    if (!(await resolveAiConfig(c.env, c.env.DB)).kind.match(/^(custom|workers)$/))
-      return c.json({ error: 'AI 未配置' }, 503)
+    const cfg = await resolveAiConfig(c.env, c.env.DB)
+    if (!cfg.kind.match(/^(custom|workers)$/)) return c.json({ error: 'AI 未配置' }, 503)
     const classId = Number(c.req.param('id'))
-    const { from, to } = await c.req.json<{ from?: string; to?: string }>()
+    const { from, to, force } = await c.req.json<{ from?: string; to?: string; force?: boolean }>()
     const f = from && /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : dayjs().subtract(6, 'day').format('YYYY-MM-DD')
     const t = to && /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : dayjs().format('YYYY-MM-DD')
 
@@ -43,6 +44,14 @@ aiRoutes.post(
       作业未交: report.homework.filter((h) => h.count > 0).map((h) => ({ 姓名: maskName(h.name), 次数: h.count, 明细: h.detail })),
     }
 
+    // 缓存：同一区间数据没变就直接复用上次结果（不消耗额度）
+    const scope = `${f}~${t}`
+    const fp = await fingerprintOf(data)
+    if (!force) {
+      const hit = await readAiOutput<{ text: string }>(c.env.DB, classId, 'report_summary', scope, fp)
+      if (hit) return c.json({ text: hit.payload.text, cached: true, created_at: hit.created_at })
+    }
+
     try {
       const text = await aiComplete(
         c.env,
@@ -51,7 +60,8 @@ aiRoutes.post(
         JSON.stringify(data),
         { maxTokens: dayjs(t).diff(dayjs(f), 'day') + 1 > 10 ? 1000 : 700 },
       )
-      return c.json({ text })
+      await writeAiOutput(c.env.DB, classId, 'report_summary', scope, fp, { text }, cfg.model ?? null)
+      return c.json({ text, cached: false })
     } catch (e: any) {
       return c.json({ error: e instanceof AiError ? e.message : 'AI 调用失败' }, 502)
     }
@@ -65,9 +75,10 @@ aiRoutes.post(
   authenticate,
   requireRole('teacher', 'admin'),
   async (c) => {
-    if (!(await resolveAiConfig(c.env, c.env.DB)).kind.match(/^(custom|workers)$/))
-      return c.json({ error: 'AI 未配置' }, 503)
+    const cfg = await resolveAiConfig(c.env, c.env.DB)
+    if (!cfg.kind.match(/^(custom|workers)$/)) return c.json({ error: 'AI 未配置' }, 503)
     const classId = Number(c.req.param('id'))
+    const { force } = await c.req.json<{ force?: boolean }>().catch(() => ({ force: false }))
     const since = dayjs().subtract(29, 'day').format('YYYY-MM-DD')
     const today = dayjs().format('YYYY-MM-DD')
 
@@ -113,6 +124,20 @@ aiRoutes.post(
         .filter(Boolean),
     }
 
+    // 缓存：近 30 天窗口固定，数据没变就复用（scope 用 since~today，跨天后自然换 key）
+    const scope = `${since}~${today}`
+    const fp = await fingerprintOf(data)
+    if (!force) {
+      const hit = await readAiOutput<{ items: Array<{ level: string; text: string }> }>(
+        c.env.DB,
+        classId,
+        'attendance_insights',
+        scope,
+        fp,
+      )
+      if (hit) return c.json({ items: hit.payload.items, cached: true, created_at: hit.created_at })
+    }
+
     try {
       const text = await aiComplete(
         c.env,
@@ -122,17 +147,43 @@ aiRoutes.post(
         { maxTokens: 500 },
       )
       const parsed = extractJson<Array<{ level?: string; text?: string }>>(text)
-      const items = (Array.isArray(parsed) ? parsed : [])
+      let items = (Array.isArray(parsed) ? parsed : [])
         .filter((it) => it && typeof it.text === 'string' && it.text.trim())
         .slice(0, 5)
         .map((it) => ({ level: it.level === 'warn' ? 'warn' : 'info', text: it.text!.trim() }))
-      if (!items.length) return c.json({ items: [{ level: 'info', text: '近 30 天没有发现明显的考勤模式问题。' }] })
-      return c.json({ items })
+      if (!items.length) items = [{ level: 'info', text: '近 30 天没有发现明显的考勤模式问题。' }]
+      await writeAiOutput(c.env.DB, classId, 'attendance_insights', scope, fp, { items }, cfg.model ?? null)
+      return c.json({ items, cached: false })
     } catch (e: any) {
       return c.json({ error: e instanceof AiError ? e.message : 'AI 调用失败' }, 502)
     }
   },
 )
+
+/** 读取已缓存的周总结（页面加载时展示上次结果，不触发 AI）。 */
+aiRoutes.get('/api/classes/:id/report/summary', authenticate, requireRole('teacher', 'admin'), async (c) => {
+  const classId = Number(c.req.param('id'))
+  const from = c.req.query('from')
+  const to = c.req.query('to')
+  const f = from && /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : dayjs().subtract(6, 'day').format('YYYY-MM-DD')
+  const t = to && /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : dayjs().format('YYYY-MM-DD')
+  const hit = await peekAiOutput<{ text: string }>(c.env.DB, classId, 'report_summary', `${f}~${t}`)
+  return c.json(hit ? { text: hit.payload.text, cached: true, created_at: hit.created_at } : { text: null })
+})
+
+/** 读取已缓存的考勤洞察（页面加载时展示上次结果，不触发 AI）。 */
+aiRoutes.get('/api/classes/:id/attendance/insights', authenticate, requireRole('teacher', 'admin'), async (c) => {
+  const classId = Number(c.req.param('id'))
+  const since = dayjs().subtract(29, 'day').format('YYYY-MM-DD')
+  const today = dayjs().format('YYYY-MM-DD')
+  const hit = await peekAiOutput<{ items: Array<{ level: string; text: string }> }>(
+    c.env.DB,
+    classId,
+    'attendance_insights',
+    `${since}~${today}`,
+  )
+  return c.json(hit ? { items: hit.payload.items, cached: true, created_at: hit.created_at } : { items: null })
+})
 
 /* ---------- AI 设置（管理页；平台管理员） ---------- */
 
