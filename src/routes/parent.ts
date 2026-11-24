@@ -118,27 +118,38 @@ parentRoutes.post('/api/parent/:key/consent', async (c) => {
   return c.json({ ok: true, consent: { version: CONSENT_VERSION, agreed: true, consented_at: at } })
 })
 
-/** 家长绑定：学号 + 身份证后六位 双凭据校验 → 签发长效令牌。限流防枚举。 */
+/** 家长绑定：仅凭身份证后六位校验（班内比对）→ 签发长效令牌。限流防枚举。 */
 parentRoutes.post('/api/parent/:key/bind', async (c) => {
   const ip = c.req.header('CF-Connecting-IP') ?? c.req.header('X-Forwarded-For') ?? '?'
   if (codeRateLimited(ip)) return c.json({ error: '尝试太频繁，请一分钟后再试' }, 429)
   if (!c.env.PARENT_ID_SECRET) return c.json({ error: '家长身份核验未配置（需管理员配置 PARENT_ID_SECRET）' }, 503)
   const cls = await classByKey(c, c.req.param('key'))
   if (!cls) return c.json({ error: '链接无效' }, 404)
-  const { student_no, id_tail } = await c.req.json<{ student_no?: string; id_tail?: string }>()
-  const no = (student_no ?? '').trim()
-  const tail = normalizeIdTail(id_tail ?? '')
-  if (!no || !tail) return c.json({ error: '请输入学号和身份证后六位' }, 400)
+  const { id_tail } = await c.req.json<{ id_tail?: string }>()
+  const raw = (id_tail ?? '').trim()
+  if (!raw) return c.json({ error: '请输入孩子的身份证后六位' }, 400)
+  const tail = normalizeIdTail(raw)
+  if (!tail) return c.json({ error: '身份证后六位格式不对（5 位数字 + 1 位数字或 X）' }, 400)
 
-  const stu = await c.env.DB
-    .prepare('SELECT id, name, id_tail_hash FROM students WHERE class_id = ?1 AND student_no = ?2 AND active = 1')
-    .bind(cls.id, no)
-    .first<{ id: number; name: string; id_tail_hash: string | null }>()
-  if (!stu) return c.json({ error: '学号或身份证后六位不正确，请核对后重试' }, 400)
-  const expect = await hmacIdTail(c.env.PARENT_ID_SECRET, stu.id, tail)
-  if (!stu.id_tail_hash || stu.id_tail_hash !== expect) {
-    return c.json({ error: '学号或身份证后六位不正确，请核对后重试' }, 400)
+  // 只凭后六位定位学生：取本班已录入核验信息的学生，逐个 HMAC 比对。
+  // 哈希带 studentId 参与运算，所以不能直接 WHERE 查询，只能遍历（班级规模 ~50 人，成本可忽略）。
+  const candidates = (
+    await c.env.DB.prepare(
+      'SELECT id, name, student_no, id_tail_hash FROM students WHERE class_id = ?1 AND active = 1 AND id_tail_hash IS NOT NULL',
+    )
+      .bind(cls.id)
+      .all<any>()
+  ).results as Array<{ id: number; name: string; student_no: string | null; id_tail_hash: string }>
+
+  let stu: { id: number; name: string; student_no: string | null } | null = null
+  for (const cand of candidates) {
+    const expect = await hmacIdTail(c.env.PARENT_ID_SECRET, cand.id, tail)
+    if (cand.id_tail_hash === expect) {
+      stu = { id: cand.id, name: cand.name, student_no: cand.student_no }
+      break
+    }
   }
+  if (!stu) return c.json({ error: '身份证后六位不正确，请核对后重试' }, 400)
 
   const token = `ptk-${crypto.randomUUID().replaceAll('-', '')}${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
   const hash = await sha256hex(token)
@@ -151,7 +162,7 @@ parentRoutes.post('/api/parent/:key/bind', async (c) => {
 
   return c.json({
     token,
-    student: { name: maskName(stu.name), student_no: no },
+    student: { name: maskName(stu.name), student_no: stu.student_no ?? '' },
     // 新绑定记录尚未同意协议 → 前端立即弹同意框
     consent: consentOf({}),
   })

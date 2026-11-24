@@ -5,7 +5,7 @@ import type { AppContext } from './types.js'
  * 协议版本号：与服务协议/隐私政策的「更新日期」保持一致。
  * 协议内容有实质变更时**必须**改为新日期——全部账号会在下次进入时被要求重新同意一次。
  */
-export const CONSENT_VERSION = '2026-11-23'
+export const CONSENT_VERSION = '2026-11-24'
 
 export interface ConsentState {
   version: string

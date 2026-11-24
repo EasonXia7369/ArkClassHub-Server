@@ -211,7 +211,7 @@ describe('微信订阅消息通道', () => {
       await inject({
         method: 'POST',
         url: `/api/parent/${parentKey}/bind`,
-        payload: { student_no: '01', id_tail: '12345X' },
+        payload: { id_tail: '12345X' },
       })
     ).json().token
 
