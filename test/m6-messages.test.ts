@@ -4,6 +4,7 @@ import { createTestCtx } from './helpers.js'
 const { inject, rawRequest, db } = createTestCtx()
 
 describe('消息板块', () => {
+  let adminToken: string
   let teacherToken: string
   let kioskToken: string
   let otherTeacherToken: string
@@ -16,6 +17,7 @@ describe('消息板块', () => {
       url: '/api/auth/activate',
       payload: { code: 'TESTBOOT', name: '管理员', password: 'admin123' },
     })
+    adminToken = admin.json().token
     const inv = await inject({
       method: 'POST',
       url: '/api/admin/invites',
@@ -224,6 +226,40 @@ describe('消息板块', () => {
       { authorization: `Bearer ${otherTeacherToken}` },
     )
     expect(fetchOther.status).toBe(403)
+
+    // 管理员必须能取回：消息列表对管理员放行，媒体不能单独拒绝——
+    // 否则管理员能看到气泡却看不到图（就是"媒体丢失"的主要表现）。
+    const fetchAdmin = await rawRequest(
+      'GET',
+      `/api/classes/${classId}/messages/media/${msgId}`,
+      { authorization: `Bearer ${adminToken}` },
+    )
+    expect(fetchAdmin.status).toBe(200)
+    expect(fetchAdmin.headers.get('Content-Type')).toBe('image/png')
+  })
+
+  it('协作教师能取回媒体（鉴权与消息列表同口径）', async () => {
+    // 直接把「李老师」挂成本班协作教师（走接口还要同校校验，与本用例无关）
+    const other = db.prepare("SELECT id FROM users WHERE name = '李老师'").get() as { id: number }
+    db.prepare('INSERT INTO class_teachers (class_id, user_id) VALUES (?,?)').run(classId, other.id)
+
+    const send = await rawRequest(
+      'POST',
+      `/api/classes/${classId}/messages/upload?kind=image&mime=image/png`,
+      { authorization: `Bearer ${otherTeacherToken}`, 'Content-Type': 'application/octet-stream' },
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 9, 8, 7]),
+    )
+    expect(send.status).toBe(200)
+    const msgId = ((await send.json()) as any).message.id
+
+    const back = await rawRequest(
+      'GET',
+      `/api/classes/${classId}/messages/media/${msgId}`,
+      { authorization: `Bearer ${teacherToken}` },
+    )
+    expect(back.status).toBe(200)
+
+    db.prepare('DELETE FROM class_teachers WHERE class_id = ? AND user_id = ?').run(classId, other.id)
   })
 
   it('媒体超 400KB 被拒绝', async () => {
@@ -301,14 +337,42 @@ describe('消息板块', () => {
     const rows = db
       .prepare('SELECT sender_role, kind, body FROM messages WHERE class_id = ? ORDER BY id')
       .all(classId) as any[]
-    // 3 条文字（老师/值日生/老师）+ 图片 + 语音各 1
-    expect(rows).toHaveLength(6)
+    // 3 条文字（老师/值日生/老师）+ 图片 + 语音各 1 + 协作教师那条图片
+    expect(rows).toHaveLength(7)
     expect(rows.filter((r) => r.kind === 'text').map((r) => r.sender_role)).toEqual([
       'teacher',
       'student',
       'teacher',
     ])
-    expect(rows.filter((r) => r.kind === 'image')).toHaveLength(1)
+    expect(rows.filter((r) => r.kind === 'image')).toHaveLength(2)
     expect(rows.filter((r) => r.kind === 'voice')).toHaveLength(2)
+  })
+
+  it('after=0 返回最新 limit 条（老班级不会只看到开头）', async () => {
+    // 清掉已有消息，灌 260 条，limit 取 200
+    db.prepare('DELETE FROM messages WHERE class_id = ?').run(classId)
+    const ins = db.prepare("INSERT INTO messages (class_id, sender_role, kind, body) VALUES (?,?, 'text', ?)")
+    for (let i = 1; i <= 260; i++) ins.run(classId, 'teacher', `第 ${i} 条`)
+
+    const res = await inject({
+      method: 'GET',
+      url: `/api/classes/${classId}/messages?after=0&limit=200`,
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    expect(res.statusCode).toBe(200)
+    const msgs = res.json().messages as any[]
+    expect(msgs).toHaveLength(200)
+    // 最后一条必须是全场最新那条（不是第 200 条）
+    expect(msgs[msgs.length - 1].body).toBe('第 260 条')
+    // 且仍按 id 升序（前端追加逻辑依赖这个顺序）
+    expect(msgs[0].body).toBe('第 61 条')
+
+    // 增量拉取不受影响
+    const inc = await inject({
+      method: 'GET',
+      url: `/api/classes/${classId}/messages?after=${msgs[msgs.length - 1].id}&limit=200`,
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    expect(inc.json().messages).toHaveLength(0)
   })
 })

@@ -32,7 +32,9 @@ export function createApp() {
     '/api/*',
     cors({
       origin: ALLOWED_ORIGINS,
-      allowHeaders: ['Content-Type', 'Authorization'],
+      // X-Push-Device 是前端上报的「本设备推送标识」（推送时排除自己，不提醒自己）。
+      // 漏了它 → 开了推送通知的设备所有请求都在预检阶段被拒，表现是整页数据加载不出来。
+      allowHeaders: ['Content-Type', 'Authorization', 'X-Push-Device'],
       allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
       maxAge: 86400,
     }),

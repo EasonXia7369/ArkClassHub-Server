@@ -62,17 +62,27 @@ messageRoutes.get(
     if (!sender) return c.json({ error: '无权访问该班级消息' }, 403)
     const after = Number(c.req.query('after') ?? 0) || 0
     const limit = Math.min(Number(c.req.query('limit') ?? 100), 300)
-    const rows = (
-      await c.env.DB.prepare(
-        `SELECT m.id, m.class_id, m.sender_role, m.kind, m.body, m.media_mime, m.media_duration_ms, m.created_at, m.popup,
+    // after=0（首次进页面）要的是「最新的 limit 条」，不是「最早的 limit 条」——
+    // 否则超过 300 条消息的老班级永远只看到开头，新消息全被丢掉。
+    // 取最新 N 条后仍按 id 升序返回，前端追加逻辑不需要改。
+    const where = 'WHERE m.class_id = ?1 AND m.id > ?2 AND m.deleted = 0'
+    const select = `SELECT m.id, m.class_id, m.sender_role, m.kind, m.body, m.media_mime, m.media_duration_ms, m.created_at, m.popup,
                 (m.media IS NOT NULL) AS has_media,
                 COALESCE(st.name, CASE WHEN m.sender_role = 'student' THEN '值日生' ELSE '老师' END) AS sender_name, m.actor_student_id
          FROM messages m
-         LEFT JOIN students st ON st.id = m.actor_student_id
-         WHERE m.class_id = ?1 AND m.id > ?2 AND m.deleted = 0 ORDER BY m.id ASC LIMIT ?3`,
-      )
-        .bind(classId, after, limit)
-        .all<any>()
+         LEFT JOIN students st ON st.id = m.actor_student_id`
+    const rows = (
+      after === 0
+        ? await c.env.DB.prepare(
+            `SELECT * FROM (
+               ${select} ${where} ORDER BY m.id DESC LIMIT ?3
+             ) ORDER BY id ASC`,
+          )
+            .bind(classId, 0, limit)
+            .all<any>()
+        : await c.env.DB.prepare(`${select} ${where} ORDER BY m.id ASC LIMIT ?3`)
+            .bind(classId, after, limit)
+            .all<any>()
     ).results.map((r) => ({ ...r, popup: !!r.popup, created_at: isoTs(r.created_at) }))
     return c.json({ messages: rows })
   },
@@ -468,13 +478,9 @@ messageRoutes.get(
     const token = bearerToken(c) || c.req.query('token') || ''
     const user = await sessionFromToken(c.env.DB, token)
     if (!user) return c.json({ error: '未登录' }, 401)
-    const allowed =
-      user.role === 'student'
-        ? user.classId === classId
-        : !!(await c.env.DB
-            .prepare('SELECT 1 AS ok FROM classes WHERE id = ?1 AND teacher_id = ?2')
-            .bind(classId, user.userId)
-            .first())
+    // 必须与消息列表同一口径（canAccessClass）：之前这里手写「只认 classes.teacher_id」，
+    // 导致管理员和协作教师能看消息气泡、却取不到图片/语音 → 媒体静默空白。
+    const allowed = await canAccessClass(c.env.DB, user, classId)
     if (!allowed) return c.json({ error: '无权访问该班级消息' }, 403)
     const msgId = Number(c.req.param('msgId'))
     const row = await c.env.DB.prepare(
