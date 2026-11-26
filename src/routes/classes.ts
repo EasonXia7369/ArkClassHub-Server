@@ -753,7 +753,7 @@ classRoutes.put('/api/classes/:id/restore', ...teacher, async (c) => {
     ...ins('students', ['id', 'class_id', 'name', 'seq', 'pinyin_initial', 'active', 'updated_at'], data.students ?? []),
     ...ins('attendance', ['id', 'class_id', 'day', 'student_id', 'slot', 'status', 'note', 'updated_by_role', 'updated_at'], data.attendance ?? []),
     ...ins('leaves', ['id', 'class_id', 'student_id', 'from_day', 'to_day', 'reason', 'status', 'decided_by', 'created_at'], data.leaves ?? []),
-    ...ins('homework_records', ['id', 'class_id', 'day', 'subject', 'title', 'missing_json', 'deleted', 'updated_at'], data.homework_records ?? []),
+    ...ins('homework_records', ['id', 'class_id', 'day', 'subject', 'item_no', 'title', 'missing_json', 'deleted', 'updated_at'], (data.homework_records ?? []).map((r: any) => ({ item_no: 0, ...r }))),
     ...ins('homework_tasks', ['id', 'class_id', 'day', 'subject', 'content', 'deleted', 'updated_at'], data.homework_tasks ?? []),
     ...ins('duty_roster', ['id', 'class_id', 'week_start', 'weekday', 'student_id', 'role', 'seq'], data.duty_roster ?? []),
     ...ins('audit_logs', ['id', 'class_id', 'ts', 'actor', 'actor_id', 'action', 'detail'], data.audit_logs ?? []),

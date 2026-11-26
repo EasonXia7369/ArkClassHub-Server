@@ -107,6 +107,116 @@ describe('M4 作业与值日', () => {
     expect(math.missing).toEqual([stuIds[2]])
   })
 
+  it('同科多项作业：item_no 区分未交名单，互不覆盖', async () => {
+    const put = (item_no: number, title: string, missing: number[]) =>
+      inject({
+        method: 'PUT',
+        url: `/api/classes/${classId}/hw-records`,
+        payload: { day: '2026-11-14', subject: '语文', item_no, title, missing },
+        headers: { authorization: `Bearer ${teacherToken}` },
+      })
+    // 语文当天两项：①背诵 ②作文，未交名单不同
+    const r0 = await put(0, '背诵第 3 段', [stuIds[0]])
+    const r1 = await put(1, '作文', [stuIds[1], stuIds[2]])
+    expect(r0.statusCode).toBe(200)
+    expect(r1.statusCode).toBe(200)
+
+    const read = await inject({
+      method: 'GET',
+      url: `/api/classes/${classId}/hw-records?from=2026-11-14&to=2026-11-14`,
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    const recs = read.json().records
+    expect(recs).toHaveLength(2)
+    expect(recs.map((r: any) => r.item_no).sort()).toEqual([0, 1])
+    expect(recs.find((r: any) => r.item_no === 0).missing).toEqual([stuIds[0]])
+    expect(recs.find((r: any) => r.item_no === 1).missing).toEqual([stuIds[1], stuIds[2]])
+    expect(recs.find((r: any) => r.item_no === 0).title).toBe('背诵第 3 段')
+  })
+
+  it('不传 item_no 的写入落到第 0 项（老前端行为不变）', async () => {
+    await inject({
+      method: 'PUT',
+      url: `/api/classes/${classId}/hw-records`,
+      payload: { day: '2026-11-15', subject: '数学', title: '练习册 P40', missing: [stuIds[0]] },
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    const read = await inject({
+      method: 'GET',
+      url: `/api/classes/${classId}/hw-records?from=2026-11-15&to=2026-11-15`,
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    expect(read.json().records).toHaveLength(1)
+    expect(read.json().records[0].item_no).toBe(0)
+  })
+
+  it('只改名单不传 title 时保留原作业名（大板快捷登记不会清掉名称）', async () => {
+    await inject({
+      method: 'PUT',
+      url: `/api/classes/${classId}/hw-records`,
+      payload: { day: '2026-11-16', subject: '英语', item_no: 0, title: '背诵单词', missing: [stuIds[0]] },
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    // 第二次只打名单，不带 title
+    await inject({
+      method: 'PUT',
+      url: `/api/classes/${classId}/hw-records`,
+      payload: { day: '2026-11-16', subject: '英语', item_no: 0, missing: [stuIds[1]] },
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    const read = await inject({
+      method: 'GET',
+      url: `/api/classes/${classId}/hw-records?from=2026-11-16&to=2026-11-16`,
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    const r = read.json().records[0]
+    expect(r.title).toBe('背诵单词')
+    expect(r.missing).toEqual([stuIds[1]])
+  })
+
+  it('按 item_no 删除：只删该项，其他项保留', async () => {
+    const del = await inject({
+      method: 'DELETE',
+      url: `/api/classes/${classId}/hw-records?day=2026-11-14&subject=${encodeURIComponent('语文')}&item_no=1`,
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    expect(del.statusCode).toBe(200)
+    const read = await inject({
+      method: 'GET',
+      url: `/api/classes/${classId}/hw-records?from=2026-11-14&to=2026-11-14`,
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    const alive = read.json().records.filter((r: any) => !r.deleted)
+    expect(alive).toHaveLength(1)
+    expect(alive[0].item_no).toBe(0)
+  })
+
+  it('不传 item_no 的删除清掉该科当天所有项（老前端「删除本次」语义）', async () => {
+    await inject({
+      method: 'DELETE',
+      url: `/api/classes/${classId}/hw-records?day=2026-11-15&subject=${encodeURIComponent('数学')}`,
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    const read = await inject({
+      method: 'GET',
+      url: `/api/classes/${classId}/hw-records?from=2026-11-15&to=2026-11-15`,
+      headers: { authorization: `Bearer ${teacherToken}` },
+    })
+    expect(read.json().records.filter((r: any) => !r.deleted)).toHaveLength(0)
+  })
+
+  it('item_no 非法（负数/超上限/小数）返回 400', async () => {
+    for (const bad of [-1, 10, 1.5]) {
+      const res = await inject({
+        method: 'PUT',
+        url: `/api/classes/${classId}/hw-records`,
+        payload: { day: '2026-11-17', subject: '物理', item_no: bad, title: '', missing: [] },
+        headers: { authorization: `Bearer ${teacherToken}` },
+      })
+      expect(res.statusCode).toBe(400)
+    }
+  })
+
   it('布置作业；清空内容即删除', async () => {
     const put = await inject({
       method: 'PUT',

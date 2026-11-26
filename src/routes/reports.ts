@@ -113,10 +113,10 @@ export async function collectReport(db: D1Database, classId: number, from: strin
       .all<any>()
   ).results
 
-  /* 作业未交汇总 */
+  /* 作业未交汇总（同一科一天多项时，明细里带上作业名以便区分） */
   const hwRows = (
     await db.prepare(
-      `SELECT day, subject, missing_json FROM homework_records
+      `SELECT day, subject, title, item_no, missing_json FROM homework_records
        WHERE class_id = ?1 AND deleted = 0 AND day >= ?2 AND day <= ?3 ORDER BY day`,
     )
       .bind(classId, from, to)
@@ -129,7 +129,8 @@ export async function collectReport(db: D1Database, classId: number, from: strin
       const entry = hwAgg.get(sid)
       if (!entry) continue
       entry.count++
-      entry.detail.push(`${r.day} ${r.subject}`)
+      const tag = r.title ? `（${r.title}）` : r.item_no ? `（第${r.item_no + 1}项）` : ''
+      entry.detail.push(`${r.day} ${r.subject}${tag}`)
     }
   }
   const homework = [...hwAgg.values()].sort((a, b) => b.count - a.count)
