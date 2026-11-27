@@ -49,6 +49,17 @@ async function examOfClass(db: any, classId: number, eid: number): Promise<(Exam
   return { ...exam, subjects: parseSubjects(exam.subjects_json) }
 }
 
+/**
+ * 「这场考试在某场之前」的判定：先比日期，同一天再比 id。
+ * 考试列表本身按 day ASC, id ASC 排，所以这是严格在它之前。
+ * 用途：AI 生成某场考试的点评/总结时，只能看到这场及以前的数据——
+ * 早期直接把全部历史丢给 AI，它会把后面考试的成绩写进这次的分析里。
+ */
+function isBefore(a: { id: number; day: string }, b: { id: number; day: string }): boolean {
+  if (a.day !== b.day) return a.day < b.day
+  return a.id < b.id
+}
+
 /** 单科统计：avg/max/min/及格率/优秀率/分数段分布（缺考剔除）。 */
 function statOf(scores: Array<number | null>, full: number) {
   const valid = scores.filter((s): s is number => s !== null && s !== undefined)
@@ -661,7 +672,12 @@ examRoutes.post(
     if (cfg.kind === 'none') return c.json({ error: 'AI 未配置' }, 503)
     const classId = Number(c.req.param('id'))
     const eid = Number(c.req.param('eid'))
-    const { student_id, extra_note } = await c.req.json<{ student_id?: number; extra_note?: string }>()
+    const { student_id, extra_note, force } = await c.req.json<{
+      student_id?: number
+      extra_note?: string
+      /** 重新生成：跳过「已有点评且输入未变」的复用 */
+      force?: boolean
+    }>()
     const sid = Number(student_id ?? 0)
     if (!sid) return c.json({ error: '缺少 student_id' }, 400)
 
@@ -670,13 +686,33 @@ examRoutes.post(
     const stu = detail.students.find((r) => r.id === sid)
     if (!stu) return c.json({ error: '学生不属于本班' }, 400)
 
-    // 历次考试该生分数序列
+    // 库里已生成的评语（含指纹）：判断是否可复用
+    const existing = await c.env.DB.prepare(
+      'SELECT text, updated_at, fp FROM exam_comments WHERE exam_id = ?1 AND student_id = ?2',
+    )
+      .bind(eid, sid)
+      .first<{ text: string; updated_at: string; fp: string | null }>()
+
+    // 该生的历次分数序列。
+    // 只取「本次考试及以前」：AI 拿到后面考的分数会把它们当成本次的结果写进点评里
+    // （例如 11 月月考的点评里出现 12 月的分数）。判据是 (day, id) 严格早于本场。
+    const curExam = { id: detail.exam.id, day: detail.exam.day }
     const exams = (
       await c.env.DB.prepare('SELECT id, name, day, subjects_json FROM exams WHERE class_id = ?1 ORDER BY day ASC, id ASC')
         .bind(classId)
         .all<any>()
-    ).results.map((r) => ({ id: r.id, name: r.name, day: r.day, subjects: parseSubjects(r.subjects_json) }))
-    const history: Array<{ 考试: string; 日期: string; 各科: Record<string, number | null>; 总分: number | null }> = []
+    ).results
+      .map((r) => ({ id: r.id, name: r.name, day: r.day, subjects: parseSubjects(r.subjects_json) }))
+      .filter((e) => isBefore(e, curExam) || (e.id === curExam.id && e.day === curExam.day))
+    // id/day 只用于「是否早于本场」的判定，发给 AI 前会剔除，不进 prompt
+    const history: Array<{
+      id: number
+      day: string
+      考试: string
+      日期: string
+      各科: Record<string, number | null>
+      总分: number | null
+    }> = []
     for (const e of exams) {
       const rows = (
         await c.env.DB.prepare('SELECT subject, score FROM exam_scores WHERE exam_id = ?1 AND student_id = ?2')
@@ -694,7 +730,14 @@ examRoutes.post(
           counted++
         }
       }
-      history.push({ 考试: e.name, 日期: e.day, 各科, 总分: counted ? Math.round(total * 10) / 10 : null })
+      history.push({
+        id: e.id,
+        day: e.day,
+        考试: e.name,
+        日期: e.day,
+        各科,
+        总分: counted ? Math.round(total * 10) / 10 : null,
+      })
     }
 
     // 预计算「与本班均分的差」与「与上次相比的变化」，避免 AI 自行心算出错
@@ -735,8 +778,29 @@ examRoutes.post(
       学生姓名: stu.name,
       班级人数: detail.students.length,
       本次考试: { 名称: detail.exam.name, 日期: detail.exam.day, 各科: 本次, 总分: stu.total, 缺考科目: stu.absent },
-      历次考试: history,
+      // 只给「本次之前」的考试，并剔除内部字段 id/day（AI 不需要，也避免它把日期当标签用）
+      历史考试: history
+        .filter((h) => isBefore(h, detail.exam))
+        .map(({ id: _id, day: _day, ...rest }) => rest),
       老师补充说明: (extra_note ?? '').trim().slice(0, 200) || undefined,
+    }
+
+    // 输入数据指纹：判断已有评语是否基于当前数据生成
+    const fp = await fingerprintOf(data)
+
+    // 复用判据（都不花额度）：
+    //  1) 指纹一致 → 数据没变，直接用（老师手动改过的文本也在这条里，不会被 AI 原文覆盖）
+    //  2) 老数据没有指纹（迁移前的记录）且老师没补新说明 → 有文本就复用，避免升级后全量重算
+    //  3) 其余情况（成绩改了、多了一场历史考试、带了新的补充说明）→ 重新生成
+    const noteNow = (extra_note ?? '').trim()
+    if (!force && existing?.text) {
+      const sameData = existing.fp != null ? existing.fp === fp : !noteNow
+      if (sameData) {
+        return c.json({
+          comment: { student_id: sid, text: existing.text, updated_at: isoTs(existing.updated_at) },
+          cached: true,
+        })
+      }
     }
 
     try {
@@ -756,7 +820,7 @@ examRoutes.post(
           '　- 「高出均分」已算好：正数表示高于班级均分，负数表示低于（如 +8.5 / -6）。直接引用，不要自己再算。',
           '　- 「较上次」是该科与上一次有分考试的差值（如 +5 / -12），用于判断进步或退步；为 null 表示无可比记录。',
           '　- 「缺考科目」列出本次没考/没录的科目，若不为空需提一句（如补考安排），不要当作 0 分评价。',
-          '　- 「历次考试」是该生全部考试记录，可用来描述长期趋势（如「连续两次进步」）。',
+          '　- 「历史考试」是该生**本次及以前**的考试记录（不含之后考的），可用来描述长期趋势（如「连续两次进步」）；为空说明这是他的首个有分记录。',
           '',
           '【写法】100~180 字，一到两个自然段，连贯叙述，不要分点、不要小标题。',
           '　1) 开场点明本次考试的总体情况：总分/均分位置、整体水平或趋势（带具体数字）。',
@@ -765,20 +829,21 @@ examRoutes.post(
           '　4) 结尾给出家长可以配合的具体做法（如「每天抽 15 分钟陪孩子复盘错题」「周末一起过一遍古诗文默写」），不要「继续努力」这类空话。',
           '　5) 若老师有补充说明，自然融进正文，不要单列成一句。',
           '',
-          '【硬性要求】只基于给定数据，数字必须与数据一致，不得编造或推算未给出的分数；不要出现「AI 分析」「本系统」「根据数据」等元描述；不要引号包裹全文；不要标题；直接输出正文。',
+          '【硬性要求】只基于给定数据，数字必须与数据一致，不得编造或推算未给出的分数；**只分析「本次考试」这一场**，历史考试仅用于判断趋势，不要把历史分数当成本次的结果；不要出现「AI 分析」「本系统」「根据数据」等元描述；不要引号包裹全文；不要标题；直接输出正文。',
         ].join('\n'),
         JSON.stringify(data),
         { maxTokens: 500 },
       )
       const now = new Date().toISOString()
       await c.env.DB.prepare(
-        `INSERT INTO exam_comments (exam_id, student_id, text, updated_at)
-         VALUES (?1, ?2, ?3, ?5)
-         ON CONFLICT (exam_id, student_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at`,
+        `INSERT INTO exam_comments (exam_id, student_id, text, updated_at, fp)
+         VALUES (?1, ?2, ?3, ?5, ?6)
+         ON CONFLICT (exam_id, student_id) DO UPDATE SET text = excluded.text,
+           updated_at = excluded.updated_at, fp = excluded.fp`,
       )
-        .bind(eid, sid, text, now, now)
+        .bind(eid, sid, text, now, now, fp)
         .run()
-      return c.json({ comment: { student_id: sid, text, updated_at: now } })
+      return c.json({ comment: { student_id: sid, text, updated_at: now }, cached: false })
     } catch (e: any) {
       return c.json({ error: e instanceof AiError ? e.message : 'AI 调用失败' }, 502)
     }
@@ -798,10 +863,13 @@ examRoutes.put(
     const t = (text ?? '').trim()
     if (!t || t.length > 600) return c.json({ error: '评语内容必填且不超过 600 字' }, 400)
     const now = new Date().toISOString()
+    // fp 置 NULL：老师改写后的文本不再对应「某个数据指纹」，
+    // 后续「全班一键」会按「无指纹 + 有文本 → 复用」处理，不会被 AI 原文覆盖。
     await c.env.DB.prepare(
-      `INSERT INTO exam_comments (exam_id, student_id, text, updated_at)
-       VALUES (?1, ?2, ?3, ?4)
-       ON CONFLICT (exam_id, student_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at`,
+      `INSERT INTO exam_comments (exam_id, student_id, text, updated_at, fp)
+       VALUES (?1, ?2, ?3, ?4, NULL)
+       ON CONFLICT (exam_id, student_id) DO UPDATE SET text = excluded.text,
+         updated_at = excluded.updated_at, fp = NULL`,
     )
       .bind(eid, sid, t, now)
       .run()
